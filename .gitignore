@@ -1,0 +1,17 @@
+**/*.DS_Store
+
+backend/target
+
+**/target
+**/node_modules
+
+.env
+.idea
+
+**/*logs
+
+*.png
+*.jpg
+
+**/venv
+
