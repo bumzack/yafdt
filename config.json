@@ -1,0 +1,13 @@
+{
+  "root": "/Users/bumzack/stoff/coding/rust/yafdt/test_data",
+  "target": "/Users/bumzack/stoff/coding/rust/yafdt/test_data/to_delete",
+  "min_size_mb": 0,
+  "exclude_folders": [
+    "/Users/bumzack/stoff/coding/rust/yafdt/test_data/excluded",
+    "/Users/bumzack/stoff/coding/rust/yafdt/test_data/to_delete"
+  ],
+  "prioritize_folders": [
+    "/Users/bumzack/stoff/coding/rust/yafdt/test_data/prio"
+  ],
+  "unprioritize_folders": []
+}

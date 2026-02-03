@@ -1,0 +1,14 @@
+[package]
+name = "dupe_finder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.33"
+egui = "0.33"
+walkdir = "2"
+md5 = "0.7"
+crossbeam-channel = "0.5"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149" }
+
