@@ -489,6 +489,32 @@ struct MovePlanItem {
 /// Build the list of files that *would* be moved, without touching the disk.
 /// `folders` is read-only here. The kept-folder guard (>=1 kept) is the
 /// caller's responsibility.
+/// Resolve a destination that never overwrites an existing file. If `dest`
+/// already exists, append `.1`, `.2`, ... to the full filename until a free
+/// path is found (e.g. `a.txt` -> `a.txt.1` -> `a.txt.2`). Returns the path.
+fn unique_dest(dest: &Path) -> PathBuf {
+    if !dest.exists() {
+        return dest.to_path_buf();
+    }
+    let parent = dest.parent();
+    let name = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut n = 1u32;
+    loop {
+        let candidate_name = format!("{}.{}", name, n);
+        let candidate = match parent {
+            Some(p) => p.join(candidate_name),
+            None => PathBuf::from(candidate_name),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 fn plan_move(folders: &[Folder], root: &Path, target: &Path) -> (Vec<MovePlanItem>, Vec<String>) {
     let mut plan: Vec<MovePlanItem> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
@@ -506,7 +532,7 @@ fn plan_move(folders: &[Folder], root: &Path, target: &Path) -> (Vec<MovePlanIte
                     continue;
                 }
             };
-            let dest = target.join(rel);
+            let dest = unique_dest(&target.join(rel));
             plan.push(MovePlanItem {
                 src: f.path.clone(),
                 dest: dest.to_string_lossy().to_string(),
@@ -518,13 +544,16 @@ fn plan_move(folders: &[Folder], root: &Path, target: &Path) -> (Vec<MovePlanIte
 }
 
 /// Execute a previously built plan: move each src to its dest, creating parent
-/// dirs as needed. Returns (moved_count, per_file_errors).
+/// dirs as needed. Never overwrites — if the dest exists at execution time,
+/// re-resolves with `.1`/`.2`/... Returns (moved_count, per_file_errors).
 fn execute_move(plan: &[MovePlanItem]) -> (usize, Vec<String>) {
     let mut moved = 0;
     let mut errors: Vec<String> = Vec::new();
     for item in plan {
         let p = Path::new(&item.src);
-        let dest = Path::new(&item.dest);
+        // Re-resolve: a previous item in this same batch may have created
+        // item.dest already.
+        let dest = unique_dest(Path::new(&item.dest));
         if let Some(parent) = dest.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
                 errors.push(format!("mkdir {} failed: {}", parent.display(), e));
@@ -532,11 +561,11 @@ fn execute_move(plan: &[MovePlanItem]) -> (usize, Vec<String>) {
             }
         }
         println!("moving ||{}||  -->  ||{}||", p.display(), dest.display());
-        if let Err(e) = fs::rename(p, dest) {
+        if let Err(e) = fs::rename(p, &dest) {
             if e.raw_os_error() == Some(18) /* EXDEV */
                 || e.kind() == io::ErrorKind::CrossesDevices
             {
-                if let Err(e2) = fs::copy(p, dest).and_then(|_| fs::remove_file(p)) {
+                if let Err(e2) = fs::copy(p, &dest).and_then(|_| fs::remove_file(p)) {
                     errors.push(format!("copy {} failed: {}", item.src, e2));
                     continue;
                 }
@@ -893,12 +922,19 @@ async fn main() {
         .map(|s| s.trim_start_matches('.').to_ascii_lowercase())
         .collect();
 
-    let exclude_dirs: Vec<PathBuf> = cli
+    let mut exclude_dirs: Vec<PathBuf> = cli
         .exclude_dirs
         .iter()
         .chain(prefs.exclude_dirs.iter())
         .map(|s| fs::canonicalize(s).unwrap_or_else(|_| PathBuf::from(s)))
         .collect();
+
+    // Always exclude the target folder (where duplicates get moved to) so that
+    // files moved there on a previous run are never re-scanned as new sources.
+    let target_canon = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
+    if !exclude_dirs.contains(&target_canon) {
+        exclude_dirs.push(target_canon);
+    }
 
     let exclude_components: Vec<String> = cli
         .exclude_components
@@ -1431,5 +1467,210 @@ mod tests {
         let p = Prefs::default_values();
         assert_eq!(p.bind, "127.0.0.1:8787");
         assert!(p.open_browser);
+    }
+
+    // ---- unique_dest (never overwrite) ----
+
+    #[test]
+    fn unique_dest_no_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("a.txt");
+        assert_eq!(unique_dest(&dest), dest);
+    }
+
+    #[test]
+    fn unique_dest_with_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        // pre-create a.txt; the unique dest should be a.txt.1
+        fs::write(tmp.path().join("a.txt"), b"x").unwrap();
+        let dest = unique_dest(&tmp.path().join("a.txt"));
+        assert_eq!(dest.file_name().unwrap(), "a.txt.1");
+        // pre-create a.txt.1 too; should get a.txt.2
+        fs::write(tmp.path().join("a.txt.1"), b"x").unwrap();
+        let dest2 = unique_dest(&tmp.path().join("a.txt"));
+        assert_eq!(dest2.file_name().unwrap(), "a.txt.2");
+    }
+
+    #[test]
+    fn unique_dest_no_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("Makefile"), b"x").unwrap();
+        let dest = unique_dest(&tmp.path().join("Makefile"));
+        assert_eq!(dest.file_name().unwrap(), "Makefile.1");
+    }
+
+    // ---- target folder is auto-ignored during scan ----
+
+    #[test]
+    fn scan_excludes_target_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let target = root.join("moved_here");
+
+        // two genuine duplicates outside target
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(root.join("a/x.txt"), b"dup").unwrap();
+        fs::write(root.join("b/x.txt"), b"dup").unwrap();
+
+        // a file ALREADY inside target that matches the duplicates' content.
+        // If target is auto-excluded, it won't appear as a third copy.
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("x.txt"), b"dup").unwrap();
+
+        let mut filter = empty_filter();
+        filter.exclude_dirs.push(target.clone());
+        let folders = scan(root, &filter);
+
+        // Only folders a and b should appear (target/x.txt is excluded).
+        assert_eq!(folders.len(), 2);
+        assert!(folders.iter().all(|f| !f.folder.ends_with("moved_here")));
+    }
+
+    // ---- move_non_kept: non-overwrite + target structure (e2e) ----
+
+    /// End-to-end test mirroring the real test_data layout:
+    ///   prio/Cargo.toml, excluded/Cargo.toml, to_delete/prionon/Cargo.toml
+    /// all identical. Keep `excluded`, move the rest to target, verify the
+    /// target tree preserves relative paths and the kept folder is untouched.
+    /// Then run a SECOND move after recreating the sources and confirm the
+    /// .1/.2 non-overwrite suffix kicks in (target already has the files).
+    #[test]
+    fn e2e_move_preserves_paths_and_no_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let target = root.join("moved");
+
+        // build three identical files in three folders (like test_data)
+        for dir in ["prio", "excluded", "to_delete/prionon"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let cargo = b"[package]\nname=\"x\"\nversion=\"0.1.0\"\n[dependencies]\n";
+        let main = b"fn main(){}\n";
+        fs::write(root.join("prio/Cargo.toml"), cargo).unwrap();
+        fs::write(root.join("excluded/Cargo.toml"), cargo).unwrap();
+        fs::write(root.join("to_delete/prionon/Cargo.toml"), cargo).unwrap();
+        fs::write(root.join("prio/main.rs"), main).unwrap();
+        fs::write(root.join("excluded/main.rs"), main).unwrap();
+        fs::write(root.join("to_delete/prionon/main.rs"), main).unwrap();
+
+        let mut filter = empty_filter();
+        filter.exclude_dirs.push(target.clone());
+
+        // ---- first move: keep `excluded` ----
+        let mut folders = scan(root, &filter);
+        assert_eq!(folders.len(), 3, "expected prio/excluded/to_delete(prionon)");
+        for fv in folders.iter_mut() {
+            if fv.folder.ends_with("excluded") {
+                fv.keep = true;
+            }
+        }
+        let (moved, errors) = move_non_kept(&mut folders, root, &target);
+        assert!(errors.is_empty(), "{:?}", errors);
+        assert_eq!(moved, 4, "prio (Cargo.toml, main.rs) + to_delete/prionon (Cargo.toml, main.rs)");
+
+        // target should mirror the relative paths
+        assert!(target.join("prio/Cargo.toml").exists());
+        assert!(target.join("prio/main.rs").exists());
+        assert!(target.join("to_delete/prionon/Cargo.toml").exists());
+        assert!(target.join("to_delete/prionon/main.rs").exists());
+
+        // kept folder untouched
+        assert!(root.join("excluded/Cargo.toml").exists());
+        assert!(root.join("excluded/main.rs").exists());
+        // moved-away files gone from source
+        assert!(!root.join("prio/Cargo.toml").exists());
+        assert!(!root.join("to_delete/prionon/main.rs").exists());
+
+        // ---- second move: recreate sources, keep excluded again ----
+        fs::write(root.join("prio/Cargo.toml"), cargo).unwrap();
+        fs::write(root.join("to_delete/prionon/Cargo.toml"), cargo).unwrap();
+        fs::write(root.join("prio/main.rs"), main).unwrap();
+        fs::write(root.join("to_delete/prionon/main.rs"), main).unwrap();
+
+        let mut folders2 = scan(root, &filter);
+        for fv in folders2.iter_mut() {
+            if fv.folder.ends_with("excluded") {
+                fv.keep = true;
+            }
+        }
+        let (moved2, errors2) = move_non_kept(&mut folders2, root, &target);
+        assert!(errors2.is_empty(), "{:?}", errors2);
+        assert_eq!(moved2, 4);
+
+        // Non-overwrite: original target files still present, plus .1 suffixed
+        assert!(target.join("prio/Cargo.toml").exists());       // original
+        assert!(target.join("prio/Cargo.toml.1").exists());       // second move
+        assert!(target.join("to_delete/prionon/main.rs").exists());
+        assert!(target.join("to_delete/prionon/main.rs.1").exists());
+    }
+
+    // ---- plan_move previews the non-overwrite dest too ----
+
+    #[test]
+    fn plan_move_uses_unique_dest_when_target_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let target = root.join("moved");
+
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/f.txt"), b"dup").unwrap();
+        // pre-populate the target so the planned dest must shift to .1
+        fs::create_dir_all(target.join("src")).unwrap();
+        fs::write(target.join("src/f.txt"), b"existing").unwrap();
+
+        let mut folders = vec![Folder {
+            folder: root.join("src").to_string_lossy().to_string(),
+            keep: false,
+            files: vec![FileEntry {
+                path: root.join("src/f.txt").to_string_lossy().to_string(),
+                size: 3,
+            }],
+            total_size: 3,
+        }];
+
+        let (plan, errors) = plan_move(&folders, root, &target);
+        assert!(errors.is_empty(), "{:?}", errors);
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].dest.ends_with("moved/src/f.txt.1"), "got {}", plan[0].dest);
+
+        // sanity: the kept-folder guard isn't this fn's concern; leave folders alone
+        let _ = &mut folders;
+    }
+
+    // ---- move errors are collected per-file, batch continues ----
+
+    #[test]
+    fn move_collects_errors_for_missing_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let target = root.join("moved");
+
+        // one real file + one that doesn't exist (simulated by a plan entry
+        // pointing at a nonexistent src)
+        let folders = vec![Folder {
+            folder: root.join("src").to_string_lossy().to_string(),
+            keep: false,
+            files: vec![
+                FileEntry {
+                    path: root.join("src/real.txt").to_string_lossy().to_string(),
+                    size: 3,
+                },
+                FileEntry {
+                    path: root.join("src/ghost.txt").to_string_lossy().to_string(),
+                    size: 0,
+                },
+            ],
+            total_size: 3,
+        }];
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/real.txt"), b"abc").unwrap();
+        // deliberately do NOT create ghost.txt
+
+        let (plan, _) = plan_move(&folders, root, &target);
+        let (moved, errors) = execute_move(&plan);
+        assert_eq!(moved, 1, "real.txt should move");
+        assert_eq!(errors.len(), 1, "ghost.txt should error");
+        assert!(errors[0].contains("ghost.txt"), "{}", errors[0]);
     }
 }

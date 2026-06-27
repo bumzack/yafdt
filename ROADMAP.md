@@ -1,6 +1,6 @@
 # Duplicate Finder — Project State & Roadmap
 
-Last updated: 2026-06-27 (after #1–#6, all done)
+Last updated: 2026-06-27 (after #1–#6 + safety hardening)
 
 ## What this app is
 
@@ -128,3 +128,12 @@ Web path now starts the server immediately with `scanning=true` and empty folder
 - **Per-file keep checkboxes** — removed. Folder-only is the model.
 - **Duplicate groups in the UI** — removed. Folders are the unit.
 - **`config.json` in the repo root** — superseded by per-user prefs via `dirs`. File is now unused; safe to delete.
+
+---
+
+# Safety hardening (post-roadmap)
+
+- **Auto-ignore target folder**: the `--target` is added to `exclude_dirs` automatically, so files already moved there on a previous run are never re-scanned as duplicate sources.
+- **Never overwrite**: `unique_dest(dest)` appends `.1`, `.2`, ... to the full filename when the destination already exists (e.g. `Cargo.toml` → `Cargo.toml.1`). Applied in both `plan_move` (preview shows the real dest) and `execute_move` (re-resolves at execution time in case a prior item in the same batch created the file).
+- **Per-file error UI**: `/api/move` and `/api/preview` return per-file `errors[]`; the web UI renders them as an inline `<ul>` panel (not a blocking alert) so the batch continues and every failure is visible.
+- **Tests**: 24 total — including an e2e test (`e2e_move_preserves_paths_and_no_overwrite`) that builds a test_data-style tree, does two moves, and asserts both the target tree structure and the `.1` non-overwrite suffix; plus targeted tests for `unique_dest`, target auto-ignore, and per-file error collection.

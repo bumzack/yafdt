@@ -181,18 +181,21 @@ $("#moveBtn").on("click", function(){
              + "Each file keeps its relative path under the root. This cannot be undone.")) return;
   $("#moveResult").addClass("d-none");
   $.post(API+"/api/move").done(function(res){
-    let msg;
-    if (res.errors && res.errors.length){
-      msg = `Moved ${res.moved} file(s). ${res.errors.length} error(s):\n` + res.errors.join("\n");
-      alert(msg);
-      $("#moveResult").removeClass("d-none alert-info").addClass("alert-warning")
-        .text(`Moved ${res.moved}; ${res.errors.length} error(s) — see alert.`);
+    const $res = $("#moveResult");
+    if (res.errors && res.errors.length && !(res.errors.length===1 && res.moved===0 && !res.ok)){
+      // per-file errors — show as a panel with the list
+      $res.removeClass("d-none alert-info").addClass("alert-warning");
+      let html = `<div class="d-flex align-items-center"><b>Moved ${res.moved} file(s); ${res.errors.length} error(s):</b></div>`;
+      html += '<ul class="mb-0 mt-1">';
+      res.errors.forEach(e => { html += `<li class="path-muted">${esc(e)}</li>`; });
+      html += '</ul>';
+      $res.html(html);
     } else if (!res.ok && res.errors && res.errors.length===1 && res.moved===0){
       // blocked (no kept)
-      $("#moveResult").addClass("d-none");
+      $res.addClass("d-none");
     } else {
-      msg = `Moved ${res.moved} file(s).`;
-      $("#moveResult").removeClass("d-none alert-warning").addClass("alert-info").text(msg);
+      $res.removeClass("d-none alert-warning").addClass("alert-info")
+        .text(`Moved ${res.moved} file(s).`);
     }
     refresh();
   }).fail(function(){ alert("Move request failed."); refresh(); });
