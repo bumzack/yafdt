@@ -16,9 +16,12 @@ use std::{
     io::{self},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    thread,
 };
-use std::sync::Mutex;
 use walkdir::WalkDir;
 
 type Md5 = String;
@@ -338,7 +341,15 @@ fn md5sum(path: &Path) -> io::Result<Md5> {
 ///   1. Walk + filter + bucket every accepted file by size (cheap, no I/O reads).
 ///   2. Only hash files whose size bucket has >1 entry. Unique-size files can
 ///      never be duplicates, so they skip hashing entirely.
-fn scan(root: &Path, filter: &ScanFilter) -> Vec<Folder> {
+///
+/// `walked` / `hashed` are atomics updated as the scan progresses, so a web UI
+/// can poll them for a live counter. Pass dummy atomics if you don't care.
+fn scan_with_progress(
+    root: &Path,
+    filter: &ScanFilter,
+    walked: &AtomicUsize,
+    hashed: &AtomicUsize,
+) -> Vec<Folder> {
     // Pass 1: collect (path, size) for every accepted file, grouped by size.
     let mut by_size: HashMap<u64, Vec<(PathBuf, u64)>> = HashMap::new();
     let mut scanned = 0usize;
@@ -359,6 +370,7 @@ fn scan(root: &Path, filter: &ScanFilter) -> Vec<Folder> {
             continue;
         }
         scanned += 1;
+        walked.store(scanned, Ordering::Relaxed);
         if scanned % 1000 == 0 {
             println!("walked {} files\u{2026}", scanned);
         }
@@ -375,13 +387,14 @@ fn scan(root: &Path, filter: &ScanFilter) -> Vec<Folder> {
     );
 
     // Pass 2: hash only files in size buckets with >1 entry.
-    let mut hashed = 0usize;
+    let mut hashed_n = 0usize;
     let mut by_hash: HashMap<Md5, Vec<(PathBuf, u64)>> = HashMap::new();
     for (_, files) in by_size.into_iter().filter(|(_, v)| v.len() > 1) {
         for (path, size) in files {
-            hashed += 1;
-            if hashed % 100 == 0 {
-                println!("hashed {} files\u{2026}", hashed);
+            hashed_n += 1;
+            hashed.store(hashed_n, Ordering::Relaxed);
+            if hashed_n % 100 == 0 {
+                println!("hashed {} files\u{2026}", hashed_n);
             }
             let hash = match md5sum(&path) {
                 Ok(h) => h,
@@ -397,7 +410,7 @@ fn scan(root: &Path, filter: &ScanFilter) -> Vec<Folder> {
         }
     }
 
-    println!("hashed {} files (size prefilter skipped the rest).", hashed);
+    println!("hashed {} files (size prefilter skipped the rest).", hashed_n);
 
     // Keep only hashes with >1 file (duplicates), then bucket every duplicate
     // copy by its parent folder.
@@ -432,6 +445,14 @@ fn scan(root: &Path, filter: &ScanFilter) -> Vec<Folder> {
     folders
 }
 
+/// Synchronous scan wrapper for callers that don't care about live progress
+/// (tests, --dry-run, --gui). Uses throwaway atomics.
+fn scan(root: &Path, filter: &ScanFilter) -> Vec<Folder> {
+    let walked = AtomicUsize::new(0);
+    let hashed = AtomicUsize::new(0);
+    scan_with_progress(root, filter, &walked, &hashed)
+}
+
 /// ======================
 /// APP STATE
 /// ======================
@@ -441,6 +462,13 @@ struct AppState {
     root: PathBuf,
     target: PathBuf,
     folders: Vec<Folder>,
+    /// true while the background scan thread is still running.
+    scanning: bool,
+    /// set if the scan thread panicked / errored.
+    scan_error: Option<String>,
+    /// live counters (also written by the scan thread; read by /api/scan_progress)
+    walked: Arc<AtomicUsize>,
+    hashed: Arc<AtomicUsize>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -594,6 +622,8 @@ struct StateResponse {
     kept_folders: usize,
     total_files: usize,
     total_size: u64,
+    scanning: bool,
+    scan_error: Option<String>,
 }
 
 async fn get_state(State(st): State<SharedState>) -> Json<StateResponse> {
@@ -608,6 +638,27 @@ async fn get_state(State(st): State<SharedState>) -> Json<StateResponse> {
         kept_folders,
         total_files,
         total_size,
+        scanning: s.scanning,
+        scan_error: s.scan_error.clone(),
+    })
+}
+
+#[derive(Serialize)]
+struct ScanProgress {
+    scanning: bool,
+    scan_error: Option<String>,
+    walked: usize,
+    hashed: usize,
+}
+
+/// Live scan progress for the web UI to poll.
+async fn scan_progress(State(st): State<SharedState>) -> Json<ScanProgress> {
+    let s = st.lock().unwrap();
+    Json(ScanProgress {
+        scanning: s.scanning,
+        scan_error: s.scan_error.clone(),
+        walked: s.walked.load(Ordering::Relaxed),
+        hashed: s.hashed.load(Ordering::Relaxed),
     })
 }
 
@@ -617,22 +668,25 @@ struct MarkFolderBody {
     keep: bool,
 }
 
+/// Mark a folder as keep (or not). Cascades to subfolders: any folder whose
+/// path starts with the given folder is set to the same keep value, so a user
+/// can "keep everything under /photos/2024" with one click.
 async fn mark_folder(
     State(st): State<SharedState>,
     Json(body): Json<MarkFolderBody>,
 ) -> Json<serde_json::Value> {
     let mut s = st.lock().unwrap();
     let target = fs::canonicalize(&body.folder).unwrap_or_else(|_| PathBuf::from(&body.folder));
-    let target_str = target.to_string_lossy().to_string();
-    let mut found = false;
+    let mut count = 0;
     for f in s.folders.iter_mut() {
         let f_canon = fs::canonicalize(&f.folder).unwrap_or_else(|_| PathBuf::from(&f.folder));
-        if f_canon.to_string_lossy() == target_str {
+        // recursive cascade: this folder OR any subfolder of it
+        if f_canon == target || f_canon.starts_with(&target) {
             f.keep = body.keep;
-            found = true;
+            count += 1;
         }
     }
-    Json(serde_json::json!({"ok": found}))
+    Json(serde_json::json!({"ok": count > 0, "marked": count}))
 }
 
 #[derive(Deserialize)]
@@ -880,16 +934,43 @@ async fn main() {
     println!("Exclude parts  : {}", filter.exclude_components.join(", "));
     println!("Scanning\u{2026}");
 
-    let folders = scan(&root, &filter);
-    println!(
-        "Found {} folder(s) containing duplicates.",
-        folders.len()
-    );
+    // --gui path: scan synchronously, then launch the native window. The egui
+    // app reads AppState.folders directly, so the scan must finish first.
+    #[cfg(feature = "gui")]
+    if cli.gui {
+        let folders = scan(&root, &filter);
+        println!(
+            "Found {} folder(s) containing duplicates.",
+            folders.len()
+        );
+        let walked = Arc::new(AtomicUsize::new(0));
+        let hashed = Arc::new(AtomicUsize::new(0));
+        let state = AppState {
+            root,
+            target,
+            folders,
+            scanning: false,
+            scan_error: None,
+            walked,
+            hashed,
+        };
+        let shared = Arc::new(Mutex::new(state));
+        run_gui(shared);
+        return;
+    }
+    #[cfg(not(feature = "gui"))]
+    if cli.gui {
+        eprintln!("--gui requires building with the `gui` feature: cargo run --features gui -- --gui");
+        std::process::exit(1);
+    }
 
-    // --dry-run: print what would move if no folder is kept, then exit.
-    // Non-destructive — bypasses the kept-folder guard so the user can see the
-    // full picture before deciding which folders to keep in the real run.
+    // --dry-run: scan synchronously, print the move plan, exit. No server.
     if cli.dry_run {
+        let folders = scan(&root, &filter);
+        println!(
+            "Found {} folder(s) containing duplicates.",
+            folders.len()
+        );
         println!("\n=== DRY RUN (no folders kept — everything would move) ===");
         let (plan, errors) = plan_move(&folders, &root, &target);
         let total: u64 = plan.iter().map(|p| p.size).sum();
@@ -912,24 +993,39 @@ async fn main() {
         return;
     }
 
+    // Web path: start the server immediately with scanning=true and empty
+    // folders, spawn the scan on a background thread, and let the browser poll
+    // /api/scan_progress until it's done. The thread deposits the folders and
+    // flips scanning=false when finished.
+    let walked = Arc::new(AtomicUsize::new(0));
+    let hashed = Arc::new(AtomicUsize::new(0));
     let state = AppState {
-        root,
-        target,
-        folders,
+        root: root.clone(),
+        target: target.clone(),
+        folders: Vec::new(),
+        scanning: true,
+        scan_error: None,
+        walked: walked.clone(),
+        hashed: hashed.clone(),
     };
     let shared = Arc::new(Mutex::new(state));
 
-    if cli.gui {
-        #[cfg(feature = "gui")]
-        {
-            run_gui(shared);
-            return;
-        }
-        #[cfg(not(feature = "gui"))]
-        {
-            eprintln!("--gui requires building with the `gui` feature: cargo run --features gui -- --gui");
-            std::process::exit(1);
-        }
+    {
+        let shared = shared.clone();
+        let root = root.clone();
+        let filter = filter.clone();
+        let walked = walked.clone();
+        let hashed = hashed.clone();
+        thread::spawn(move || {
+            let folders = scan_with_progress(&root, &filter, &walked, &hashed);
+            println!(
+                "Found {} folder(s) containing duplicates.",
+                folders.len()
+            );
+            let mut s = shared.lock().unwrap();
+            s.folders = folders;
+            s.scanning = false;
+        });
     }
 
     let app = Router::new()
@@ -937,6 +1033,7 @@ async fn main() {
         .route("/index.html", get(index_handler))
         .route("/vendor/:file", get(vendor_handler))
         .route("/api/state", get(get_state))
+        .route("/api/scan_progress", get(scan_progress))
         .route("/api/mark_folder", post(mark_folder))
         .route("/api/mark_all", post(mark_all))
         .route("/api/move", post(move_marked))
@@ -1057,7 +1154,7 @@ mod gui {
                             f.total_size
                         );
                         ui.collapsing(header, |ui| {
-                            if ui.checkbox(&mut keep, "Keep this folder in place").changed() {
+                            if ui.checkbox(&mut keep, "Keep this folder + subfolders").changed() {
                                 toggles.push((i, keep));
                             }
                             ui.separator();
@@ -1066,9 +1163,18 @@ mod gui {
                             }
                         });
                     }
+                    // Apply toggles with a recursive cascade: keeping a folder
+                    // also keeps all of its subfolders.
                     for (i, keep) in toggles {
-                        if let Some(f) = s.folders.get_mut(i) {
-                            f.keep = keep;
+                        let Some(target) = s.folders.get(i) else { continue };
+                        let target_canon = fs::canonicalize(&target.folder)
+                            .unwrap_or_else(|_| PathBuf::from(&target.folder));
+                        for f in s.folders.iter_mut() {
+                            let f_canon = fs::canonicalize(&f.folder)
+                                .unwrap_or_else(|_| PathBuf::from(&f.folder));
+                            if f_canon == target_canon || f_canon.starts_with(&target_canon) {
+                                f.keep = keep;
+                            }
                         }
                     }
                 });

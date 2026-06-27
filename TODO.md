@@ -32,17 +32,17 @@
 - [x] Unit tests: `human_bytes`, prefs defaults.
 - [x] Run via `cargo test`. (17 tests, all pass; also pass with `--features gui`.)
 
-### [ ] 5. Live scan progress
-- [ ] Move `scan()` off the main thread (spawn + channel, like the old egui version).
-- [ ] Add `GET /api/scan_progress` returning `{ scanned, done }` (polled) or SSE stream.
-- [ ] In `index.html`, poll progress while `done=false`; show a spinner/counter before the folder list loads.
-- [ ] Keep egui GUI showing the same counter.
+### [x] 5. Live scan progress  ✅ DONE (commit pending)
+- [x] Move `scan()` off the main thread (spawn + atomics). Web path now starts the server immediately with `scanning=true` and empty folders; a background thread runs `scan_with_progress`, deposits folders, and flips `scanning=false`.
+- [x] Add `GET /api/scan_progress` returning `{ scanning, scan_error, walked, hashed }`.
+- [x] In `index.html`, poll progress while `scanning=true`; show a spinner + live `walked/hashed` counter before the folder list loads.
+- [x] `--gui` and `--dry-run` paths still scan synchronously (they need the result before launching / printing).
+- [x] egui GUI shows the same counters via the shared atomics.
 
-### [ ] 6. Keep-all-subfolders helper
-- [ ] Extend `MarkFolderBody` with `recursive: bool`.
-- [ ] In `mark_folder`, when recursive, match `parent.starts_with(folder)` instead of `parent == folder`.
-- [ ] Add a "Keep this folder + subfolders" checkbox in `index.html` next to the per-folder keep checkbox.
-- [ ] Mirror in egui GUI.
+### [x] 6. Keep-all-subfolders helper  ✅ DONE (commit pending)
+- [x] `mark_folder` now cascades recursively: matching `f_canon == target || f_canon.starts_with(target)` — keeping `/photos/2024` also keeps `/photos/2024/jan`, etc.
+- [x] Web UI keep badge now reads "keep (+subfolders)".
+- [x] egui GUI checkbox relabeled "Keep this folder + subfolders" with the same cascade.
 
 ## Maybe later
 

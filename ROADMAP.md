@@ -1,6 +1,6 @@
 # Duplicate Finder — Project State & Roadmap
 
-Last updated: 2026-06-27 (after #1 + #2 + #3 + #4)
+Last updated: 2026-06-27 (after #1–#6, all done)
 
 ## What this app is
 
@@ -102,11 +102,23 @@ Bootstrap/jQuery vendored into `src/static/vendor/` and embedded via `rust-embed
 ## 4. Tests — DONE ✅
 17 inline unit + integration tests in `src/main.rs` (`#[cfg(test)] mod tests`): `parse_bytes`, `human_bytes`, `ScanFilter::excluded`/`accepts`, `scan` (with `tempfile` fixtures), `plan_move`, prefs defaults. Pass with and without `--features gui`.
 
-## 5. Live scan progress
-Scan is synchronous and blocks `main`; page only loads after it finishes. For big roots: spawn scan on a thread, stream file count via `/api/scan_progress` (polled or SSE) so the browser shows a live counter. The old egui version did this with `crossbeam-channel`; easy to restore.
+## 5. Live scan progress — DONE ✅
+Web path now starts the server immediately with `scanning=true` and empty folders; a background thread runs `scan_with_progress` (taking `AtomicUsize` counters), deposits the folders, and flips `scanning=false`. New `GET /api/scan_progress` returns `{ scanning, scan_error, walked, hashed }`. `index.html` polls it every 700ms and shows a spinner + live counter until the scan finishes, then fetches the folder list. `--gui`/`--dry-run` still scan synchronously (they need the result before launching/printing).
 
-## 6. Keep-all-subfolders helper
-A folder checkbox keeps that exact folder. If a user wants "keep everything under `/photos/2024`," they currently check every subfolder. Add `recursive: true` to `mark_folder` matching `parent.starts_with(folder)` — one line in handler, one checkbox in UI.
+## 6. Keep-all-subfolders helper — DONE ✅
+`mark_folder` cascades recursively: `f_canon == target || f_canon.starts_with(target)` — keeping `/photos/2024` also keeps `/photos/2024/jan`. Web UI keep badge reads "keep (+subfolders)"; egui checkbox relabeled "Keep this folder + subfolders" with the same cascade.
+
+---
+
+# Roadmap / Next steps (priority order)
+
+## Done
+1. Hashing performance (size prefilter + streaming hash) — ✅
+2. Dry-run / preview before move — ✅
+3. Self-contained binary (vendored assets) — ✅
+4. Tests — ✅
+5. Live scan progress — ✅
+6. Keep-all-subfolders helper — ✅
 
 ---
 

@@ -33,6 +33,11 @@
   </div>
 </div>
 
+<div id="scanProgress" class="alert alert-secondary py-2 d-none">
+  <span class="spinner-border spinner-border-sm me-2"></span>
+  <span id="scanProgressText"></span>
+</div>
+
 <div id="blockWarning" class="alert alert-danger py-2 d-none">
   No folder is marked to <b>keep</b>. Move is blocked until you check at least one folder.
 </div>
@@ -67,14 +72,54 @@ function openKey(f){ return "open:"+f; }
 function rememberOpen(f, val){ val ? localStorage.setItem(openKey(f),"1") : localStorage.removeItem(openKey(f)); }
 function isOpen(f){ return localStorage.getItem(openKey(f))==="1"; }
 
+let pollTimer = null;
+function startProgressPoll(){
+  if (pollTimer) return;
+  pollTimer = setInterval(refreshProgress, 700);
+}
+function stopProgressPoll(){
+  if (pollTimer){ clearInterval(pollTimer); pollTimer = null; }
+}
+function refreshProgress(){
+  $.getJSON(API+"/api/scan_progress").done(function(p){
+    if (p.scan_error){
+      $("#scanProgress").removeClass("d-none alert-secondary").addClass("alert-danger")
+        .find("#scanProgressText").text("Scan failed: " + p.scan_error);
+      stopProgressPoll();
+      return;
+    }
+    if (p.scanning){
+      $("#scanProgress").removeClass("d-none alert-danger").addClass("alert-secondary");
+      $("#scanProgressText").text(`Scanning\u2026 walked ${p.walked} files, hashed ${p.hashed}`);
+    } else {
+      $("#scanProgress").addClass("d-none");
+      stopProgressPoll();
+      refresh(); // final fetch of folders + summary
+    }
+  });
+}
+
 function refresh(){
   $.getJSON(API+"/api/state").done(function(s){
     $("#summary").html(
       `root: <code>${esc(s.root)}</code> &middot; ` +
       `target: <code>${esc(s.target)}</code> &middot; ` +
-      `${s.folders.length} folder(s) &middot; ${s.total_files} duplicate file(s) &middot; ` +
-      `${human(s.total_size)} total &middot; ${s.kept_folders} kept`
+      (s.scanning
+        ? "scanning\u2026"
+        : `${s.folders.length} folder(s) &middot; ${s.total_files} duplicate file(s) &middot; ` +
+          `${human(s.total_size)} total &middot; ${s.kept_folders} kept`)
     );
+    if (s.scan_error){
+      $("#scanProgress").removeClass("d-none alert-secondary").addClass("alert-danger")
+        .find("#scanProgressText").text("Scan failed: " + s.scan_error);
+    }
+    if (s.scanning){
+      $("#folders").html('<div class="text-muted">Scanning\u2026 results will appear when the scan finishes.</div>');
+      $("#moveBtn").prop("disabled", true);
+      $("#previewBtn").prop("disabled", true);
+      startProgressPoll();
+      return;
+    }
     const noKept = s.folders.length > 0 && s.kept_folders === 0;
     $("#blockWarning").toggleClass("d-none", !noKept);
     $("#moveBtn").prop("disabled", s.folders.length === 0 || noKept);
@@ -105,7 +150,7 @@ function renderFolders(folders){
               <span class="fw-semibold">${esc(f.folder)}</span>
               <span class="badge bg-secondary">${f.files.length} file${f.files.length===1?"":"s"}</span>
               <span class="badge bg-light text-dark">${human(f.total_size)}</span>
-              ${f.keep ? '<span class="badge badge-keep">keep</span>' : '<span class="badge badge-move">move</span>'}
+              ${f.keep ? '<span class="badge badge-keep">keep (+subfolders)</span>' : '<span class="badge badge-move">move</span>'}
             </summary>
           </details>
         </div>
