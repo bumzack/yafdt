@@ -1,6 +1,6 @@
 # Duplicate Finder — Project State & Roadmap
 
-Last updated: 2026-06-27
+Last updated: 2026-06-27 (after #1 + #2)
 
 ## What this app is
 
@@ -90,19 +90,11 @@ cargo run --features gui -- --root <dir> --target <dir> --gui
 
 # Roadmap / Next steps (priority order)
 
-## 1. Hashing performance — HIGHEST IMPACT
-Current `md5sum` reads the whole file into RAM (`read_to_end` into a `Vec`) — slow + memory-heavy on big media.
+## 1. Hashing performance — DONE ✅
+`md5sum` now streams via `BufReader` + `io::copy` into `md5::Context` (O(1) memory). `scan` is two-pass: walk + bucket by size, then hash only size groups with >1 file. Unique-size files skip hashing entirely.
 
-Two cheap wins:
-- **Size pre-filter**: bucket files by size *first*; only hash groups with >1 file of the same size. Unique-size files skip hashing entirely. Huge win on mixed trees.
-- **Stream the hash**: `BufReader` + chunked `Read` into `Md5` instead of slurping the whole file. O(1) memory.
-
-Expected: 10–50x faster on photo libraries.
-
-## 2. Dry-run / preview before move
-`--dry-run` flag + "Preview" button: lists exactly what would move (source → dest, total bytes) without touching disk. Move is irreversible, so preview is the single biggest safety win.
-
-Implementation: `move_non_kept` already builds (src, dest) pairs — just skip `fs::rename` when dry-run is on and return the list.
+## 2. Dry-run / preview before move — DONE ✅
+`--dry-run` CLI flag prints the full move plan (src → dest, total bytes) and exits without touching disk. `move_non_kept` split into `plan_move` (pure) + `execute_move`. New `POST /api/preview` returns the plan (same kept-folder guard as move). Web UI has a "Preview move" button showing a src/dest/size table.
 
 ## 3. Self-contained binary (vendored assets)
 Bootstrap/jQuery currently load from CDN → breaks offline. Vendor `bootstrap.min.css`, `jquery.min.js`, `bootstrap.bundle.min.js` into `src/static/` (already served via `rust-embed`) and point HTML at local paths. ~150KB added; works fully offline.

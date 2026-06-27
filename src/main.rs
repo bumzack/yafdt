@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
-    io::{self, Read},
+    io::{self},
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -187,6 +187,11 @@ struct Cli {
     /// Ignore the user prefs file entirely for this run.
     #[arg(long)]
     no_prefs: bool,
+
+    /// Don't move anything. Print what *would* be moved (src \u2192 dest, total
+    /// bytes) to the terminal and exit. Useful as a pre-flight check.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 fn parse_bytes(s: &str) -> Option<u64> {
@@ -204,6 +209,19 @@ fn parse_bytes(s: &str) -> Option<u64> {
         _ => return None,
     };
     Some((n * mult) as u64)
+}
+
+/// Human-readable byte count for terminal output.
+fn human_bytes(b: u64) -> String {
+    if b >= 1024 * 1024 * 1024 {
+        format!("{:.2} GB", b as f64 / 1024.0 / 1024.0 / 1024.0)
+    } else if b >= 1024 * 1024 {
+        format!("{:.2} MB", b as f64 / 1024.0 / 1024.0)
+    } else if b >= 1024 {
+        format!("{:.1} KB", b as f64 / 1024.0)
+    } else {
+        format!("{} B", b)
+    }
 }
 
 /// ======================
@@ -302,18 +320,27 @@ impl ScanFilter {
 }
 
 fn md5sum(path: &Path) -> io::Result<Md5> {
-    let mut file = fs::File::open(path)?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
-    Ok(format!("{:x}", md5::compute(buf)))
+    // Stream the file through a BufReader into the md5 Context (which impls
+    // io::Write). O(1) memory regardless of file size, instead of slurping the
+    // whole file into a Vec.
+    let file = fs::File::open(path)?;
+    let mut reader = io::BufReader::with_capacity(64 * 1024, file);
+    let mut ctx = md5::Context::new();
+    io::copy(&mut reader, &mut ctx)?;
+    Ok(format!("{:x}", ctx.compute()))
 }
 
 /// Scan `root`, hash files, and build a list of folders that contain duplicate
 /// files. A folder appears in the result only if at least one file in it has
 /// the same content (hash) as some file elsewhere.
+///
+/// Two-pass for performance:
+///   1. Walk + filter + bucket every accepted file by size (cheap, no I/O reads).
+///   2. Only hash files whose size bucket has >1 entry. Unique-size files can
+///      never be duplicates, so they skip hashing entirely.
 fn scan(root: &Path, filter: &ScanFilter) -> Vec<Folder> {
-    // hash -> list of (path, size)
-    let mut by_hash: HashMap<Md5, Vec<(PathBuf, u64)>> = HashMap::new();
+    // Pass 1: collect (path, size) for every accepted file, grouped by size.
+    let mut by_size: HashMap<u64, Vec<(PathBuf, u64)>> = HashMap::new();
     let mut scanned = 0usize;
 
     for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
@@ -331,26 +358,46 @@ fn scan(root: &Path, filter: &ScanFilter) -> Vec<Folder> {
         if !filter.accepts(p, &meta) {
             continue;
         }
-
         scanned += 1;
-        if scanned % 100 == 0 {
-            println!("scanned {} files\u{2026}", scanned);
+        if scanned % 1000 == 0 {
+            println!("walked {} files\u{2026}", scanned);
         }
-
-        let hash = match md5sum(p) {
-            Ok(h) => h,
-            Err(e) => {
-                println!("skip (hash error {:?}): {:?}", e, p);
-                continue;
-            }
-        };
-        by_hash
-            .entry(hash)
+        by_size
+            .entry(meta.len())
             .or_insert_with(Vec::new)
             .push((p.to_path_buf(), meta.len()));
     }
 
-    println!("scanned {} files.", scanned);
+    println!(
+        "walked {} files, {} distinct size bucket(s).",
+        scanned,
+        by_size.len()
+    );
+
+    // Pass 2: hash only files in size buckets with >1 entry.
+    let mut hashed = 0usize;
+    let mut by_hash: HashMap<Md5, Vec<(PathBuf, u64)>> = HashMap::new();
+    for (_, files) in by_size.into_iter().filter(|(_, v)| v.len() > 1) {
+        for (path, size) in files {
+            hashed += 1;
+            if hashed % 100 == 0 {
+                println!("hashed {} files\u{2026}", hashed);
+            }
+            let hash = match md5sum(&path) {
+                Ok(h) => h,
+                Err(e) => {
+                    println!("skip (hash error {:?}): {:?}", e, path);
+                    continue;
+                }
+            };
+            by_hash
+                .entry(hash)
+                .or_insert_with(Vec::new)
+                .push((path, size));
+        }
+    }
+
+    println!("hashed {} files (size prefilter skipped the rest).", hashed);
 
     // Keep only hashes with >1 file (duplicates), then bucket every duplicate
     // copy by its parent folder.
@@ -402,60 +449,98 @@ type SharedState = Arc<Mutex<AppState>>;
 /// MOVE
 /// ======================
 
+/// One planned move: source file -> destination under target, preserving the
+/// full relative path from root.
+#[derive(Debug, Clone, Serialize)]
+struct MovePlanItem {
+    src: String,
+    dest: String,
+    size: u64,
+}
+
+/// Build the list of files that *would* be moved, without touching the disk.
+/// `folders` is read-only here. The kept-folder guard (>=1 kept) is the
+/// caller's responsibility.
+fn plan_move(folders: &[Folder], root: &Path, target: &Path) -> (Vec<MovePlanItem>, Vec<String>) {
+    let mut plan: Vec<MovePlanItem> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    for fv in folders {
+        if fv.keep {
+            continue;
+        }
+        for f in &fv.files {
+            let p = Path::new(&f.path);
+            let rel = match p.strip_prefix(root) {
+                Ok(r) => r,
+                Err(_) => {
+                    errors.push(format!("not under root: {}", f.path));
+                    continue;
+                }
+            };
+            let dest = target.join(rel);
+            plan.push(MovePlanItem {
+                src: f.path.clone(),
+                dest: dest.to_string_lossy().to_string(),
+                size: f.size,
+            });
+        }
+    }
+    (plan, errors)
+}
+
+/// Execute a previously built plan: move each src to its dest, creating parent
+/// dirs as needed. Returns (moved_count, per_file_errors).
+fn execute_move(plan: &[MovePlanItem]) -> (usize, Vec<String>) {
+    let mut moved = 0;
+    let mut errors: Vec<String> = Vec::new();
+    for item in plan {
+        let p = Path::new(&item.src);
+        let dest = Path::new(&item.dest);
+        if let Some(parent) = dest.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                errors.push(format!("mkdir {} failed: {}", parent.display(), e));
+                continue;
+            }
+        }
+        println!("moving ||{}||  -->  ||{}||", p.display(), dest.display());
+        if let Err(e) = fs::rename(p, dest) {
+            if e.raw_os_error() == Some(18) /* EXDEV */
+                || e.kind() == io::ErrorKind::CrossesDevices
+            {
+                if let Err(e2) = fs::copy(p, dest).and_then(|_| fs::remove_file(p)) {
+                    errors.push(format!("copy {} failed: {}", item.src, e2));
+                    continue;
+                }
+            } else {
+                errors.push(format!("rename {} failed: {}", item.src, e));
+                continue;
+            }
+        }
+        moved += 1;
+    }
+    (moved, errors)
+}
+
 /// Move every file in every non-kept folder to target/<rel path from root>.
 /// Returns (moved, errors). Errors are per-file so one bad file doesn't abort
-/// the whole batch.
+/// the whole batch. Also prunes moved files from `folders` so the UI updates.
 fn move_non_kept(
     folders: &mut Vec<Folder>,
     root: &Path,
     target: &Path,
 ) -> (usize, Vec<String>) {
-    let mut moved = 0;
-    let mut errors: Vec<String> = Vec::new();
+    let (plan, mut errors) = plan_move(folders, root, target);
+    let (moved, exec_errors) = execute_move(&plan);
+    errors.extend(exec_errors);
 
+    // Clear files in non-kept folders (they've been moved); keep kept folders as-is.
     for fv in folders.iter_mut() {
-        if fv.keep {
-            continue;
+        if !fv.keep {
+            fv.files.clear();
+            fv.total_size = 0;
         }
-        // Snapshot of paths we'll move (we mutate files below).
-        let to_move: Vec<(String, u64)> = fv.files.iter().map(|f| (f.path.clone(), f.size)).collect();
-        for (path_str, _size) in &to_move {
-            let p = Path::new(path_str);
-            let rel = match p.strip_prefix(root) {
-                Ok(r) => r,
-                Err(_) => {
-                    errors.push(format!("not under root: {}", path_str));
-                    continue;
-                }
-            };
-            let dest = target.join(rel);
-            if let Some(parent) = dest.parent() {
-                if let Err(e) = fs::create_dir_all(parent) {
-                    errors.push(format!("mkdir {} failed: {}", parent.display(), e));
-                    continue;
-                }
-            }
-            println!("moving ||{}||  -->  ||{}||", p.display(), dest.display());
-            if let Err(e) = fs::rename(p, &dest) {
-                if e.raw_os_error() == Some(18) /* EXDEV */
-                    || e.kind() == io::ErrorKind::CrossesDevices
-                {
-                    if let Err(e2) = fs::copy(p, &dest).and_then(|_| fs::remove_file(p)) {
-                        errors.push(format!("copy {} failed: {}", path_str, e2));
-                        continue;
-                    }
-                } else {
-                    errors.push(format!("rename {} failed: {}", path_str, e));
-                    continue;
-                }
-            }
-            moved += 1;
-        }
-        // The folder's files have been moved; clear them so the UI updates.
-        fv.files.clear();
     }
-
-    // Drop folders that are now empty.
     folders.retain(|f| !f.files.is_empty() || f.keep);
     (moved, errors)
 }
@@ -563,6 +648,42 @@ struct MoveResult {
     moved: usize,
     kept_folders: usize,
     errors: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PreviewResult {
+    ok: bool,
+    kept_folders: usize,
+    plan: Vec<MovePlanItem>,
+    total_size: u64,
+    errors: Vec<String>,
+}
+
+/// Build (but do NOT execute) the move plan. Same kept-folder guard as move.
+async fn preview_move(State(st): State<SharedState>) -> Json<PreviewResult> {
+    let s = st.lock().unwrap();
+    let kept = s.folders.iter().filter(|f| f.keep).count();
+    if kept == 0 && !s.folders.is_empty() {
+        return Json(PreviewResult {
+            ok: false,
+            kept_folders: 0,
+            plan: vec![],
+            total_size: 0,
+            errors: vec!["No folder is marked to keep — move blocked. Check at least one folder.".into()],
+        });
+    }
+    let root = s.root.clone();
+    let target = s.target.clone();
+    let (plan, errors) = plan_move(&s.folders, &root, &target);
+    let total_size = plan.iter().map(|p| p.size).sum();
+    let kept_folders = kept;
+    Json(PreviewResult {
+        ok: errors.is_empty(),
+        kept_folders,
+        plan,
+        total_size,
+        errors,
+    })
 }
 
 async fn move_marked(State(st): State<SharedState>) -> Json<MoveResult> {
@@ -754,6 +875,32 @@ async fn main() {
         folders.len()
     );
 
+    // --dry-run: print what would move if no folder is kept, then exit.
+    // Non-destructive — bypasses the kept-folder guard so the user can see the
+    // full picture before deciding which folders to keep in the real run.
+    if cli.dry_run {
+        println!("\n=== DRY RUN (no folders kept — everything would move) ===");
+        let (plan, errors) = plan_move(&folders, &root, &target);
+        let total: u64 = plan.iter().map(|p| p.size).sum();
+        for item in &plan {
+            println!("  {}  -->  {}", item.src, item.dest);
+        }
+        println!(
+            "\n{} file(s) would move, {} total ({}).",
+            plan.len(),
+            total,
+            human_bytes(total)
+        );
+        if !errors.is_empty() {
+            println!("errors:");
+            for e in &errors {
+                println!("  {}", e);
+            }
+        }
+        println!("=== end dry run ===");
+        return;
+    }
+
     let state = AppState {
         root,
         target,
@@ -781,6 +928,7 @@ async fn main() {
         .route("/api/mark_folder", post(mark_folder))
         .route("/api/mark_all", post(mark_all))
         .route("/api/move", post(move_marked))
+        .route("/api/preview", post(preview_move))
         .with_state(shared);
 
     let bind_str = cli.bind.clone().unwrap_or_else(|| prefs.bind.clone());

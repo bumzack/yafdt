@@ -28,6 +28,7 @@
   <div class="ms-auto d-flex gap-2">
     <button id="keepAllBtn" class="btn btn-outline-success btn-sm">Keep all</button>
     <button id="keepNoneBtn" class="btn btn-outline-secondary btn-sm">Keep none</button>
+    <button id="previewBtn" class="btn btn-outline-primary btn-sm">Preview move</button>
     <button id="moveBtn" class="btn btn-warning btn-sm">Move non-kept</button>
   </div>
 </div>
@@ -36,6 +37,21 @@
   No folder is marked to <b>keep</b>. Move is blocked until you check at least one folder.
 </div>
 <div id="moveResult" class="alert alert-info py-2 d-none"></div>
+
+<div id="previewPanel" class="card mb-3 d-none">
+  <div class="card-header d-flex align-items-center">
+    <span class="fw-semibold">Move preview</span>
+    <span id="previewSummary" class="text-muted small ms-2"></span>
+    <button id="previewClose" class="btn-close ms-auto" aria-label="Close"></button>
+  </div>
+  <div class="card-body p-2" style="max-height: 360px; overflow:auto;">
+    <div id="previewErrors" class="alert alert-warning py-1 mb-2 d-none"></div>
+    <table class="table table-sm table-borderless mb-0">
+      <thead><tr><th>Source</th><th>Destination</th><th class="text-end">Size</th></tr></thead>
+      <tbody id="previewBody"></tbody>
+    </table>
+  </div>
+</div>
 
 <div id="folders"></div>
 
@@ -62,6 +78,7 @@ function refresh(){
     const noKept = s.folders.length > 0 && s.kept_folders === 0;
     $("#blockWarning").toggleClass("d-none", !noKept);
     $("#moveBtn").prop("disabled", s.folders.length === 0 || noKept);
+    $("#previewBtn").prop("disabled", s.folders.length === 0 || noKept);
     renderFolders(s.folders);
   }).fail(function(){
     $("#folders").html('<div class="text-danger">Failed to load state.</div>');
@@ -134,6 +151,33 @@ $("#moveBtn").on("click", function(){
     }
     refresh();
   }).fail(function(){ alert("Move request failed."); refresh(); });
+});
+
+$("#previewBtn").on("click", function(){
+  $.post(API+"/api/preview").done(function(res){
+    const $panel = $("#previewPanel").removeClass("d-none");
+    const $body = $("#previewBody").empty();
+    const $err = $("#previewErrors").addClass("d-none").empty();
+    if (!res.ok && res.errors && res.errors.length){
+      $err.removeClass("d-none").text(res.errors.join("\n"));
+      $("#previewSummary").text("");
+      return;
+    }
+    res.plan.forEach(p => {
+      $body.append(
+        `<tr><td class="path-muted">${esc(p.src)}</td>` +
+        `<td class="path-muted">${esc(p.dest)}</td>` +
+        `<td class="text-end file-size">${human(p.size)}</td></tr>`
+      );
+    });
+    $("#previewSummary").text(
+      `${res.plan.length} file(s) \u2022 ${human(res.total_size)} \u2022 ${res.kept_folders} folder(s) kept`
+    );
+  }).fail(function(){ alert("Preview request failed."); });
+});
+
+$("#previewClose").on("click", function(){
+  $("#previewPanel").addClass("d-none");
 });
 
 $("#keepAllBtn").on("click", function(){

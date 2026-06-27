@@ -2,18 +2,18 @@
 
 ## Next up (recommended pair)
 
-### [ ] 1. Hashing performance
-- [ ] Add a size-bucketing pass before hashing: collect `(path, size)` for all accepted files, group by size, only hash files whose size group has >1 entry.
-- [ ] Replace `md5sum` (full `read_to_end`) with a streaming `BufReader` + chunked `Read` into `Md5`.
-- [ ] Verify: unique-size files never get hashed; memory stays flat on large files.
-- [ ] Bench against current impl on `test_data` and a larger real folder.
+### [x] 1. Hashing performance  ✅ DONE (commit pending)
+- [x] Add a size-bucketing pass before hashing: collect `(path, size)` for all accepted files, group by size, only hash files whose size group has >1 entry.
+- [x] Replace `md5sum` (full `read_to_end`) with a streaming `BufReader` + chunked `Read` into `Md5::Context` (via `io::copy` into the `Write` impl).
+- [x] Verify: unique-size files never get hashed; memory stays flat on large files. (test_data: walked 7, hashed 6 — 1 unique-size file skipped)
+- [ ] Bench against old impl on a larger real folder. *(deferred — correctness verified, big-tree bench not yet run)*
 
-### [ ] 2. Dry-run / preview before move
-- [ ] Add `--dry-run` CLI flag.
-- [ ] Refactor `move_non_kept` to split "plan" (build src→dest pairs) from "execute" (`fs::rename`).
-- [ ] In dry-run, return the plan without executing; print src→dest + total bytes to terminal.
-- [ ] Add a "Preview" button in `index.html` that calls `/api/move?dry_run=true` (or a `/api/preview` route) and shows the list in a modal/panel.
-- [ ] Make sure Move still requires ≥1 kept folder in dry-run too.
+### [x] 2. Dry-run / preview before move  ✅ DONE (commit pending)
+- [x] Add `--dry-run` CLI flag.
+- [x] Refactor `move_non_kept` to split "plan" (`plan_move`, pure) from "execute" (`execute_move`, does `fs::rename`).
+- [x] In dry-run, return the plan without executing; print src→dest + total bytes to terminal.
+- [x] Add a "Preview" button in `index.html` that calls `/api/preview` and shows the list in a panel (src/dest/size table).
+- [x] Make sure Move still requires ≥1 kept folder in dry-run too. (`/api/preview` has the same guard as `/api/move`.)
 
 ## After that
 
