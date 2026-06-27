@@ -1,6 +1,6 @@
 # Duplicate Finder — Project State & Roadmap
 
-Last updated: 2026-06-27 (after #1–#6 + safety hardening)
+Last updated: 2026-06-27 (all roadmap + safety + maybe-later items done)
 
 ## What this app is
 
@@ -136,4 +136,12 @@ Web path now starts the server immediately with `scanning=true` and empty folder
 - **Auto-ignore target folder**: the `--target` is added to `exclude_dirs` automatically, so files already moved there on a previous run are never re-scanned as duplicate sources.
 - **Never overwrite**: `unique_dest(dest)` appends `.1`, `.2`, ... to the full filename when the destination already exists (e.g. `Cargo.toml` → `Cargo.toml.1`). Applied in both `plan_move` (preview shows the real dest) and `execute_move` (re-resolves at execution time in case a prior item in the same batch created the file).
 - **Per-file error UI**: `/api/move` and `/api/preview` return per-file `errors[]`; the web UI renders them as an inline `<ul>` panel (not a blocking alert) so the batch continues and every failure is visible.
-- **Tests**: 24 total — including an e2e test (`e2e_move_preserves_paths_and_no_overwrite`) that builds a test_data-style tree, does two moves, and asserts both the target tree structure and the `.1` non-overwrite suffix; plus targeted tests for `unique_dest`, target auto-ignore, and per-file error collection.
+- **Tests**: 29 total — including an e2e test (`e2e_move_preserves_paths_and_no_overwrite`) that builds a test_data-style tree, does two moves, and asserts both the target tree structure and the `.1` non-overwrite suffix; plus targeted tests for `unique_dest`, target auto-ignore, per-file error collection, `HashAlgo` parsing, cross-algo duplicate detection, and `.DS_Store` default ignore.
+
+## Configurable hash
+
+`--hash md5` (default) | `xxhash` (fast, non-crypto) | `sha256` (paranoid). All stream via `BufReader`; xxhash uses a manual chunked `Hasher::write` loop (it doesn't impl `io::Write`). The digest is only used to compare file equality.
+
+## OS-noise auto-ignore
+
+`Prefs::default_ignore_names()` ships `.DS_Store`, `._*`, `Thumbs.db`, `desktop.ini` so macOS/Windows metadata never appears as duplicate candidates.

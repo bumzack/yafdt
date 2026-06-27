@@ -23,7 +23,7 @@ pub struct Prefs {
     #[serde(default)]
     pub min_size: Option<String>,
     /// Always ignore files whose names match these globs.
-    #[serde(default)]
+    #[serde(default = "Prefs::default_ignore_names")]
     pub ignore_names: Vec<String>,
     /// Always ignore files with these extensions.
     #[serde(default)]
@@ -60,6 +60,17 @@ impl Prefs {
     pub fn default_bind() -> String { "127.0.0.1:8787".into() }
     pub fn default_open_browser() -> bool { true }
 
+    /// macOS metadata noise, desktop.ini thumbnails, Thumbs.db caches — ignored
+    /// by default so they never appear as duplicate candidates.
+    pub fn default_ignore_names() -> Vec<String> {
+        vec![
+            ".DS_Store".into(),
+            "._*".into(),      // macOS AppleDouble resource-fork sidecar files
+            "Thumbs.db".into(),
+            "desktop.ini".into(),
+        ]
+    }
+
     pub fn config_path() -> Option<PathBuf> {
         let base = dirs::config_dir()?;
         Some(base.join("dupe_finder").join("prefs.json"))
@@ -87,7 +98,7 @@ impl Prefs {
             exclude_components: Self::default_exclude_components(),
             exclude_dirs: Vec::new(),
             min_size: None,
-            ignore_names: Vec::new(),
+            ignore_names: Self::default_ignore_names(),
             ignore_exts: Vec::new(),
             include: Vec::new(),
             bind: Self::default_bind(),

@@ -3,11 +3,78 @@ use glob::Pattern;
 use std::{
     collections::HashMap,
     fs,
-    io::{self},
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
 use walkdir::WalkDir;
+
+/// Which hash algorithm to use when detecting duplicates. The digest is only
+/// used to compare file equality — never for cryptographic purposes — so the
+/// fast non-crypto xxhash is a fine default for large scans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HashAlgo {
+    Md5,
+    Xxhash,
+    Sha256,
+}
+
+impl HashAlgo {
+    /// Parse from a CLI string ("md5" | "xxhash" | "sha256"). Case-insensitive.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "md5" => Ok(HashAlgo::Md5),
+            "xxhash" | "xxh" | "xxh64" => Ok(HashAlgo::Xxhash),
+            "sha256" | "sha2-256" => Ok(HashAlgo::Sha256),
+            other => Err(format!(
+                "unknown hash '{}': expected md5, xxhash, or sha256",
+                other
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HashAlgo::Md5 => "md5",
+            HashAlgo::Xxhash => "xxhash",
+            HashAlgo::Sha256 => "sha256",
+        }
+    }
+}
+
+/// Stream a file through a BufReader and compute its digest as a hex string.
+/// O(1) memory regardless of file size.
+fn hash_file(path: &Path, algo: HashAlgo) -> io::Result<Md5> {
+    let file = fs::File::open(path)?;
+    let mut reader = io::BufReader::with_capacity(64 * 1024, file);
+    match algo {
+        HashAlgo::Md5 => {
+            let mut ctx = md5::Context::new();
+            io::copy(&mut reader, &mut ctx)?;
+            Ok(format!("{:x}", ctx.compute()))
+        }
+        HashAlgo::Xxhash => {
+            use std::hash::Hasher;
+            use xxhash_rust::xxh64::Xxh64;
+            let mut hasher = Xxh64::new(0); // seed 0
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = reader.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.write(&buf[..n]);
+            }
+            Ok(format!("{:016x}", hasher.finish()))
+        }
+        HashAlgo::Sha256 => {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            io::copy(&mut reader, &mut hasher)?;
+            Ok(format!("{:x}", hasher.finalize()))
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ScanFilter {
@@ -19,6 +86,7 @@ pub struct ScanFilter {
     /// Directory name fragments to skip if any path component equals one of
     /// these (e.g. "node_modules", "target").
     pub exclude_components: Vec<String>,
+    pub hash_algo: HashAlgo,
 }
 
 impl ScanFilter {
@@ -78,17 +146,6 @@ impl ScanFilter {
         }
         false
     }
-}
-
-fn md5sum(path: &Path) -> io::Result<Md5> {
-    // Stream the file through a BufReader into the md5 Context (which impls
-    // io::Write). O(1) memory regardless of file size, instead of slurping
-    // the whole file into a Vec.
-    let file = fs::File::open(path)?;
-    let mut reader = io::BufReader::with_capacity(64 * 1024, file);
-    let mut ctx = md5::Context::new();
-    io::copy(&mut reader, &mut ctx)?;
-    Ok(format!("{:x}", ctx.compute()))
 }
 
 /// Scan `root`, hash files, and build a list of folders that contain duplicate
@@ -154,7 +211,7 @@ pub fn scan_with_progress(
             if hashed_n % 100 == 0 {
                 println!("hashed {} files\u{2026}", hashed_n);
             }
-            let hash = match md5sum(&path) {
+            let hash = match hash_file(&path, filter.hash_algo) {
                 Ok(h) => h,
                 Err(e) => {
                     println!("skip (hash error {:?}): {:?}", e, path);

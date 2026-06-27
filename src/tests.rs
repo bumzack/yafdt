@@ -3,7 +3,7 @@ use crate::cli::{parse_bytes, human_bytes};
 use crate::model::{FileEntry, Folder};
 use crate::move_files::{execute_move, move_non_kept, plan_move, unique_dest};
 use crate::prefs::Prefs;
-use crate::scan::{scan, ScanFilter};
+use crate::scan::{scan, HashAlgo, ScanFilter};
 use glob::Pattern;
 use std::{fs, io::Write, path::{Path, PathBuf}};
 
@@ -61,6 +61,7 @@ fn empty_filter() -> ScanFilter {
         ignore_exts: vec![],
         exclude_dirs: vec![],
         exclude_components: vec![],
+        hash_algo: HashAlgo::Md5,
     }
 }
 
@@ -443,4 +444,68 @@ fn move_collects_errors_for_missing_source() {
     assert_eq!(moved, 1, "real.txt should move");
     assert_eq!(errors.len(), 1, "ghost.txt should error");
     assert!(errors[0].contains("ghost.txt"), "{}", errors[0]);
+}
+
+// ---- HashAlgo parsing ----
+
+#[test]
+fn hash_algo_parse_valid() {
+    assert_eq!(HashAlgo::parse("md5"), Ok(HashAlgo::Md5));
+    assert_eq!(HashAlgo::parse("MD5"), Ok(HashAlgo::Md5));
+    assert_eq!(HashAlgo::parse("xxhash"), Ok(HashAlgo::Xxhash));
+    assert_eq!(HashAlgo::parse("xxh64"), Ok(HashAlgo::Xxhash));
+    assert_eq!(HashAlgo::parse("sha256"), Ok(HashAlgo::Sha256));
+    assert_eq!(HashAlgo::parse(" SHA256 "), Ok(HashAlgo::Sha256));
+}
+
+#[test]
+fn hash_algo_parse_invalid() {
+    assert!(HashAlgo::parse("crc32").is_err());
+    assert!(HashAlgo::parse("").is_err());
+    assert!(HashAlgo::parse("sha1").is_err());
+}
+
+#[test]
+fn hash_algo_as_str() {
+    assert_eq!(HashAlgo::Md5.as_str(), "md5");
+    assert_eq!(HashAlgo::Xxhash.as_str(), "xxhash");
+    assert_eq!(HashAlgo::Sha256.as_str(), "sha256");
+}
+
+// ---- all three hash algorithms detect the same duplicates ----
+
+#[test]
+fn all_hash_algos_find_same_duplicates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("a")).unwrap();
+    fs::create_dir_all(root.join("b")).unwrap();
+    fs::write(root.join("a/dup.txt"), b"identical-content").unwrap();
+    fs::write(root.join("b/dup.txt"), b"identical-content").unwrap();
+    // unique file so the size prefilter still runs
+    fs::write(root.join("a/uniq.txt"), b"unique").unwrap();
+
+    for algo in [HashAlgo::Md5, HashAlgo::Xxhash, HashAlgo::Sha256] {
+        let mut filter = empty_filter();
+        filter.hash_algo = algo;
+        let folders = scan(root, &filter);
+        assert_eq!(
+            folders.len(),
+            2,
+            "algo {:?} found {:?} folders",
+            algo,
+            folders.iter().map(|f| &f.folder).collect::<Vec<_>>()
+        );
+    }
+}
+
+// ---- .DS_Store is ignored by default ----
+
+#[test]
+fn prefs_default_ignore_names_include_ds_store() {
+    let p = Prefs::default_values();
+    assert!(p.ignore_names.contains(&".DS_Store".to_string()));
+    assert!(p.ignore_names.contains(&"._*".to_string()));
+    assert!(p.ignore_names.contains(&"Thumbs.db".to_string()));
+    assert!(p.ignore_names.contains(&"desktop.ini".to_string()));
 }

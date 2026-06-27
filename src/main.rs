@@ -15,7 +15,7 @@ use cli::{human_bytes, parse_bytes, Cli};
 use glob::Pattern;
 use model::{AppState, SharedState};
 use prefs::Prefs;
-use scan::{scan, scan_with_progress, ScanFilter};
+use scan::{scan, scan_with_progress, HashAlgo, ScanFilter};
 use std::{
     fs,
     net::SocketAddr,
@@ -160,6 +160,11 @@ async fn main() {
         .cloned()
         .collect();
 
+    let hash_algo = HashAlgo::parse(&cli.hash).unwrap_or_else(|e| {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    });
+
     let filter = ScanFilter {
         min_size,
         include_globs,
@@ -167,10 +172,12 @@ async fn main() {
         ignore_exts,
         exclude_dirs,
         exclude_components,
+        hash_algo,
     };
 
     println!("Scanning root  : {}", root.display());
     println!("Target folder  : {}", target.display());
+    println!("Hash algorithm : {}", filter.hash_algo.as_str());
     println!("Min size       : {} bytes", filter.min_size);
     println!("Include globs  : {}", include_raw.join(", "));
     println!("Ignore names   : {}", ignore_names_raw.join(", "));

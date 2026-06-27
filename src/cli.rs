@@ -61,6 +61,11 @@ pub struct Cli {
     /// bytes) to the terminal and exit. Useful as a pre-flight check.
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Hash algorithm: "md5" (default), "xxhash" (fast, non-crypto), or "sha256"
+    /// (paranoid). All produce a hex digest used only to compare equality.
+    #[arg(long, default_value = "md5")]
+    pub hash: String,
 }
 
 /// Parse a human byte size: "1", "1KB", "5MB", "100B", "1.5GB". Returns None

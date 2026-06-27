@@ -1,9 +1,5 @@
 target
 test_data
-
-
 .idea
-
-
-
 .DS_Store
+config.json

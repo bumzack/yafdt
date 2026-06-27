@@ -46,9 +46,9 @@
 
 ## Maybe later
 
-- [x] Per-file error reporting surfaced in the UI (move errors now render as an inline `<ul>` panel instead of a blocking alert). ✅ DONE (commit pending)
-- [x] Automatically ignore the target folder during scan (added to `exclude_dirs` so moved-into-target files are never re-scanned). ✅ DONE (commit pending)
-- [x] Never overwrite files anywhere — `unique_dest` appends `.1`/`.2`/... to the full filename when the destination exists (e.g. `Cargo.toml` → `Cargo.toml.1`). Applied in both `plan_move` (preview shows the real dest) and `execute_move`. ✅ DONE (commit pending)
-- [ ] Configurable hash algorithm (xxhash for speed, sha256 for paranoia) behind a flag.
-- [ ] Delete the stale `config.json` in the repo root (superseded by per-user prefs).
-- [ ] `.DS_Store` auto-ignore (macOS noise) — add to default `ignore_names`.
+- [x] Per-file error reporting surfaced in the UI (move errors now render as an inline `<ul>` panel instead of a blocking alert). ✅ DONE
+- [x] Automatically ignore the target folder during scan (added to `exclude_dirs` so moved-into-target files are never re-scanned). ✅ DONE
+- [x] Never overwrite files anywhere — `unique_dest` appends `.1`/`.2`/... to the full filename when the destination exists (e.g. `Cargo.toml` → `Cargo.toml.1`). Applied in both `plan_move` (preview shows the real dest) and `execute_move`. ✅ DONE
+- [x] Configurable hash algorithm (`--hash md5|xxhash|sha256`) behind a flag. ✅ DONE
+- [x] Delete the stale `config.json` in the repo root (superseded by per-user prefs). ✅ DONE
+- [x] `.DS_Store` auto-ignore (macOS noise) — added to default `ignore_names` (also `._*`, `Thumbs.db`, `desktop.ini`). ✅ DONE
