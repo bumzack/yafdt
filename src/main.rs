@@ -571,6 +571,17 @@ async fn index_handler() -> impl IntoResponse {
     })
 }
 
+/// Serve a vendored static asset: GET /vendor/bootstrap.min.css etc.
+/// Files live under src/static/vendor/ and are embedded by rust-embed.
+async fn vendor_handler(
+    axum::extract::Path(file): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let asset_path = format!("vendor/{}", file);
+    serve_asset(&asset_path).unwrap_or_else(|| {
+        (StatusCode::NOT_FOUND, format!("vendor asset not found: {}", file)).into_response()
+    })
+}
+
 /// ======================
 /// HANDLERS
 /// ======================
@@ -924,6 +935,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/index.html", get(index_handler))
+        .route("/vendor/:file", get(vendor_handler))
         .route("/api/state", get(get_state))
         .route("/api/mark_folder", post(mark_folder))
         .route("/api/mark_all", post(mark_all))
@@ -1069,3 +1081,249 @@ mod gui {
 
 #[cfg(feature = "gui")]
 use gui::run_gui;
+
+/// ======================
+/// TESTS
+/// ======================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    // ---- parse_bytes ----
+
+    #[test]
+    fn parse_bytes_plain_number() {
+        assert_eq!(parse_bytes("1024"), Some(1024));
+        assert_eq!(parse_bytes("0"), Some(0));
+    }
+
+    #[test]
+    fn parse_bytes_b_suffix() {
+        assert_eq!(parse_bytes("100B"), Some(100));
+        assert_eq!(parse_bytes("100b"), Some(100));
+        assert_eq!(parse_bytes("100 B"), Some(100));
+    }
+
+    #[test]
+    fn parse_bytes_kb_mb_gb() {
+        assert_eq!(parse_bytes("1KB"), Some(1024));
+        assert_eq!(parse_bytes("1kb"), Some(1024));
+        assert_eq!(parse_bytes("1K"), Some(1024));
+        assert_eq!(parse_bytes("1MB"), Some(1024 * 1024));
+        assert_eq!(parse_bytes("2 MB"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_bytes("1GB"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_bytes("1.5GB"), Some((1.5 * 1024.0 * 1024.0 * 1024.0) as u64));
+    }
+
+    #[test]
+    fn parse_bytes_invalid() {
+        assert_eq!(parse_bytes("abc"), None);
+        assert_eq!(parse_bytes(""), None);
+        assert_eq!(parse_bytes("1TB"), None); // unsupported suffix
+    }
+
+    // ---- human_bytes ----
+
+    #[test]
+    fn human_bytes_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(2048), "2.0 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1.00 MB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.00 GB");
+    }
+
+    // ---- ScanFilter::excluded ----
+
+    fn empty_filter() -> ScanFilter {
+        ScanFilter {
+            min_size: 0,
+            include_globs: vec![],
+            ignore_name_globs: vec![],
+            ignore_exts: vec![],
+            exclude_dirs: vec![],
+            exclude_components: vec![],
+        }
+    }
+
+    #[test]
+    fn excluded_by_dir_prefix() {
+        let mut f = empty_filter();
+        f.exclude_dirs = vec![PathBuf::from("/Users/foo/secret")];
+        assert!(f.excluded(Path::new("/Users/foo/secret/a.txt")));
+        assert!(f.excluded(Path::new("/Users/foo/secret/sub/b.txt")));
+        assert!(!f.excluded(Path::new("/Users/foo/public/a.txt")));
+    }
+
+    #[test]
+    fn excluded_by_component_name() {
+        let mut f = empty_filter();
+        f.exclude_components = vec!["node_modules".into(), "target".into()];
+        assert!(f.excluded(Path::new("/proj/node_modules/pkg/index.js")));
+        assert!(f.excluded(Path::new("/proj/target/debug/exe")));
+        assert!(!f.excluded(Path::new("/proj/src/main.rs")));
+        // a file literally named "target" (no extension) is still excluded by component
+        assert!(f.excluded(Path::new("/proj/target")));
+    }
+
+    #[test]
+    fn excluded_neither() {
+        let f = empty_filter();
+        assert!(!f.excluded(Path::new("/anywhere/file.txt")));
+    }
+
+    // ---- ScanFilter::accepts ----
+
+    fn meta_with_size(size: u64) -> fs::Metadata {
+        // We can't easily fake Metadata; use a real temp file of the given size.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        if size > 0 {
+            let f = fs::OpenOptions::new().write(true).open(tmp.path()).unwrap();
+            f.set_len(size).unwrap();
+        }
+        fs::metadata(tmp.path()).unwrap()
+    }
+
+    #[test]
+    fn accepts_min_size() {
+        let mut f = empty_filter();
+        f.min_size = 100;
+        assert!(!f.accepts(Path::new("/x/a.txt"), &meta_with_size(50)));
+        assert!(f.accepts(Path::new("/x/a.txt"), &meta_with_size(150)));
+        assert!(f.accepts(Path::new("/x/a.txt"), &meta_with_size(100))); // boundary inclusive
+    }
+
+    #[test]
+    fn accepts_ignore_name_glob() {
+        let mut f = empty_filter();
+        f.ignore_name_globs = vec![Pattern::new("thumb*").unwrap()];
+        assert!(!f.accepts(Path::new("/x/thumb_1.jpg"), &meta_with_size(10)));
+        assert!(f.accepts(Path::new("/x/photo.jpg"), &meta_with_size(10)));
+    }
+
+    #[test]
+    fn accepts_ignore_ext() {
+        let mut f = empty_filter();
+        f.ignore_exts = vec!["log".into(), "tmp".into()];
+        assert!(!f.accepts(Path::new("/x/debug.log"), &meta_with_size(10)));
+        assert!(!f.accepts(Path::new("/x/cache.TMP"), &meta_with_size(10))); // case-insensitive
+        assert!(f.accepts(Path::new("/x/data.json"), &meta_with_size(10)));
+    }
+
+    #[test]
+    fn accepts_include_glob() {
+        let mut f = empty_filter();
+        f.include_globs = vec![Pattern::new("*.jpg").unwrap(), Pattern::new("*.png").unwrap()];
+        assert!(f.accepts(Path::new("/x/photo.jpg"), &meta_with_size(10)));
+        assert!(f.accepts(Path::new("/x/photo.png"), &meta_with_size(10)));
+        assert!(!f.accepts(Path::new("/x/photo.gif"), &meta_with_size(10)));
+    }
+
+    // ---- scan (integration) ----
+
+    #[test]
+    fn scan_finds_duplicate_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // /a/x.txt and /b/x.txt have identical content -> duplicates
+        // /a/unique.txt is unique -> should not appear
+        // /c/sub/x.txt also identical -> third folder with a dup
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::create_dir_all(root.join("c/sub")).unwrap();
+
+        let same = b"hello-world-duplicate";
+        for dir in ["a", "b", "c/sub"] {
+            let mut f = fs::File::create(root.join(dir).join("x.txt")).unwrap();
+            f.write_all(same).unwrap();
+        }
+        let mut u = fs::File::create(root.join("a/unique.txt")).unwrap();
+        u.write_all(b"unique-content-not-a-dup").unwrap();
+
+        let filter = empty_filter();
+        let folders = scan(root, &filter);
+
+        // Three folders should appear: a, b, c/sub (each contains a dup of x.txt)
+        let folder_names: Vec<String> = folders.iter().map(|f| f.folder.clone()).collect();
+        assert_eq!(folders.len(), 3, "expected 3 folders, got {:?}", folder_names);
+
+        // Each folder should list exactly the one duplicate file (x.txt),
+        // NOT unique.txt (it was skipped by the size prefilter).
+        for fv in &folders {
+            assert_eq!(fv.files.len(), 1, "folder {} should have 1 file", fv.folder);
+            assert!(fv.files[0].path.ends_with("x.txt"));
+        }
+
+        // No folder should be kept by default.
+        assert!(folders.iter().all(|f| !f.keep));
+    }
+
+    #[test]
+    fn scan_no_duplicates_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        let mut f1 = fs::File::create(root.join("a/one.txt")).unwrap();
+        f1.write_all(b"content-one").unwrap();
+        let mut f2 = fs::File::create(root.join("b/two.txt")).unwrap();
+        f2.write_all(b"content-two-different").unwrap();
+
+        let filter = empty_filter();
+        let folders = scan(root, &filter);
+        assert!(folders.is_empty(), "expected no duplicate folders, got {:?}", folders);
+    }
+
+    // ---- plan_move (integration) ----
+
+    #[test]
+    fn plan_move_excludes_kept_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let target = root.join("target");
+
+        fs::create_dir_all(root.join("keep_me")).unwrap();
+        fs::create_dir_all(root.join("move_me")).unwrap();
+        let content = b"dup-content";
+        let mut a = fs::File::create(root.join("keep_me/f.txt")).unwrap();
+        a.write_all(content).unwrap();
+        let mut b = fs::File::create(root.join("move_me/f.txt")).unwrap();
+        b.write_all(content).unwrap();
+
+        let filter = empty_filter();
+        let mut folders = scan(root, &filter);
+        // mark keep_me as kept
+        for fv in folders.iter_mut() {
+            if fv.folder.ends_with("keep_me") {
+                fv.keep = true;
+            }
+        }
+
+        let (plan, errors) = plan_move(&folders, root, &target);
+        assert!(errors.is_empty(), "{:?}", errors);
+        // only the move_me file should be in the plan
+        assert_eq!(plan.len(), 1);
+        assert!(plan[0].src.ends_with("move_me/f.txt"));
+        assert!(plan[0].dest.ends_with("target/move_me/f.txt"));
+    }
+
+    // ---- prefs union-merge ----
+
+    #[test]
+    fn prefs_default_exclude_components_include_node_modules() {
+        let p = Prefs::default_values();
+        assert!(p.exclude_components.contains(&"node_modules".to_string()));
+        assert!(p.exclude_components.contains(&"target".to_string()));
+        assert!(p.exclude_components.contains(&".git".to_string()));
+    }
+
+    #[test]
+    fn prefs_default_bind_and_open_browser() {
+        let p = Prefs::default_values();
+        assert_eq!(p.bind, "127.0.0.1:8787");
+        assert!(p.open_browser);
+    }
+}

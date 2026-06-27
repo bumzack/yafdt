@@ -1,6 +1,6 @@
 # Duplicate Finder — Project State & Roadmap
 
-Last updated: 2026-06-27 (after #1 + #2)
+Last updated: 2026-06-27 (after #1 + #2 + #3 + #4)
 
 ## What this app is
 
@@ -96,17 +96,11 @@ cargo run --features gui -- --root <dir> --target <dir> --gui
 ## 2. Dry-run / preview before move — DONE ✅
 `--dry-run` CLI flag prints the full move plan (src → dest, total bytes) and exits without touching disk. `move_non_kept` split into `plan_move` (pure) + `execute_move`. New `POST /api/preview` returns the plan (same kept-folder guard as move). Web UI has a "Preview move" button showing a src/dest/size table.
 
-## 3. Self-contained binary (vendored assets)
-Bootstrap/jQuery currently load from CDN → breaks offline. Vendor `bootstrap.min.css`, `jquery.min.js`, `bootstrap.bundle.min.js` into `src/static/` (already served via `rust-embed`) and point HTML at local paths. ~150KB added; works fully offline.
+## 3. Self-contained binary (vendored assets) — DONE ✅
+Bootstrap/jQuery vendored into `src/static/vendor/` and embedded via `rust-embed`. New `GET /vendor/:file` route serves them. `index.html` references local `/vendor/*` paths. Binary works fully offline (~150KB added).
 
-## 4. Tests
-There are none. Pure-ish functions to unit-test with `tempfile` fixtures:
-- `parse_bytes`
-- `ScanFilter::excluded` / `accepts`
-- size-bucketing logic (from #1)
-- prefs union-merge
-
-Insurance against #1–#3 regressing the folder-only model.
+## 4. Tests — DONE ✅
+17 inline unit + integration tests in `src/main.rs` (`#[cfg(test)] mod tests`): `parse_bytes`, `human_bytes`, `ScanFilter::excluded`/`accepts`, `scan` (with `tempfile` fixtures), `plan_move`, prefs defaults. Pass with and without `--features gui`.
 
 ## 5. Live scan progress
 Scan is synchronous and blocks `main`; page only loads after it finishes. For big roots: spawn scan on a thread, stream file count via `/api/scan_progress` (polled or SSE) so the browser shows a live counter. The old egui version did this with `crossbeam-channel`; easy to restore.

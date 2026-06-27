@@ -22,3 +22,6 @@ egui = { version = "0.33", optional = true }
 [features]
 default = []
 gui = ["dep:eframe", "dep:egui"]
+
+[dev-dependencies]
+tempfile = "3"

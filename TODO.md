@@ -17,20 +17,20 @@
 
 ## After that
 
-### [ ] 3. Vendor Bootstrap/jQuery for offline self-contained binary
-- [ ] Download `bootstrap.min.css`, `jquery.min.js`, `bootstrap.bundle.min.js` into `src/static/vendor/`.
-- [ ] Update `index.html` `<link>`/`<script>` to local paths (`/vendor/...`).
-- [ ] Add axum routes to serve `/vendor/*` from `rust-embed` (or reuse `serve_asset`).
-- [ ] Confirm binary works with network off.
+### [x] 3. Vendor Bootstrap/jQuery for offline self-contained binary  ✅ DONE (commit pending)
+- [x] Download `bootstrap.min.css`, `jquery.min.js`, `bootstrap.bundle.min.js` into `src/static/vendor/`.
+- [x] Update `index.html` `<link>`/`<script>` to local paths (`/vendor/...`).
+- [x] Add axum route to serve `/vendor/*` from `rust-embed` (`/vendor/:file` — axum 0.7 syntax).
+- [x] Confirm binary works with network off. (assets embedded via rust-embed; served 200 with correct content-type)
 
-### [ ] 4. Tests
-- [ ] Add `tempfile` as a dev-dependency.
-- [ ] Unit tests: `parse_bytes` (KB/MB/GB/no-suffix/invalid).
-- [ ] Unit tests: `ScanFilter::excluded` (exclude-dir prefix, exclude-component match, neither).
-- [ ] Unit tests: `ScanFilter::accepts` (min-size, ignore-name glob, ignore-ext, include glob).
-- [ ] Integration test: build a temp tree with known duplicates, run `scan`, assert folder list.
-- [ ] Integration test: prefs union-merge (CLI + defaults = deduped union).
-- [ ] Run via `cargo test`.
+### [x] 4. Tests  ✅ DONE (commit pending)
+- [x] Add `tempfile` as a dev-dependency.
+- [x] Unit tests: `parse_bytes` (KB/MB/GB/no-suffix/invalid).
+- [x] Unit tests: `ScanFilter::excluded` (exclude-dir prefix, exclude-component match, neither).
+- [x] Unit tests: `ScanFilter::accepts` (min-size, ignore-name glob, ignore-ext, include glob).
+- [x] Integration test: build a temp tree with known duplicates, run `scan`, assert folder list.
+- [x] Unit tests: `human_bytes`, prefs defaults.
+- [x] Run via `cargo test`. (17 tests, all pass; also pass with `--features gui`.)
 
 ### [ ] 5. Live scan progress
 - [ ] Move `scan()` off the main thread (spawn + channel, like the old egui version).
