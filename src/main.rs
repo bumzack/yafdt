@@ -95,11 +95,7 @@ impl Prefs {
                 );
                 Prefs::default_values()
             }),
-            Err(_) => {
-                // No file yet; use defaults. Don't write automatically — user can
-                // run with --save-prefs to create it.
-                Prefs::default_values()
-            }
+            Err(_) => Prefs::default_values(),
         }
     }
 
@@ -166,9 +162,14 @@ struct Cli {
     #[arg(long = "exclude-dir", value_name = "DIR")]
     exclude_dirs: Vec<String>,
 
-    /// Address to serve the web UI on.
-    #[arg(long, default_value = "127.0.0.1:8787")]
-    bind: String,
+    /// Directory name fragments to always skip (matched against any path
+    /// component, e.g. 'node_modules', 'target'). Defaults come from prefs.
+    #[arg(long = "exclude-component", value_name = "NAME")]
+    exclude_components: Vec<String>,
+
+    /// Address to serve the web UI on. Defaults from prefs (127.0.0.1:8787).
+    #[arg(long)]
+    bind: Option<String>,
 
     /// Do not open a browser automatically.
     #[arg(long)]
@@ -177,6 +178,15 @@ struct Cli {
     /// Launch the native egui GUI instead of the web UI (requires the `gui` feature).
     #[arg(long)]
     gui: bool,
+
+    /// Save the current flags (exclude-components, exclude-dirs, min-size, ignore-*,
+    /// include, bind, open-browser) to the user prefs file and exit.
+    #[arg(long)]
+    save_prefs: bool,
+
+    /// Ignore the user prefs file entirely for this run.
+    #[arg(long)]
+    no_prefs: bool,
 }
 
 fn parse_bytes(s: &str) -> Option<u64> {
@@ -200,17 +210,24 @@ fn parse_bytes(s: &str) -> Option<u64> {
 /// SCAN
 /// ======================
 
+/// A single duplicate file copy. Display-only metadata; keep is per-FOLDER,
+/// not per-file, so there's no keep flag here.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct FileInfo {
-    path: PathBuf,
+struct FileEntry {
+    path: String,
     size: u64,
-    keep: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DuplicateGroup {
-    hash: String,
-    files: Vec<FileInfo>,
+/// A folder that contains at least one duplicate file copy. The user marks
+/// whole folders as "keep in place" (keep=true); unchecked folders' files
+/// get moved to target.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Folder {
+    folder: String,
+    keep: bool,
+    files: Vec<FileEntry>,
+    /// total bytes of duplicate files in this folder
+    total_size: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -220,6 +237,9 @@ struct ScanFilter {
     ignore_name_globs: Vec<Pattern>,
     ignore_exts: Vec<String>,
     exclude_dirs: Vec<PathBuf>,
+    /// Directory name fragments to skip if any path component equals one of
+    /// these (e.g. "node_modules", "target").
+    exclude_components: Vec<String>,
 }
 
 impl ScanFilter {
@@ -241,8 +261,6 @@ impl ScanFilter {
                     return false;
                 }
             }
-        } else if !self.ignore_exts.is_empty() {
-            // has no extension but extensions are ignored -> keep (only filter when ext present)
         }
         if !self.include_globs.is_empty() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -259,6 +277,28 @@ impl ScanFilter {
         }
         true
     }
+
+    /// True if the path lives inside an excluded dir or contains an excluded
+    /// component name.
+    fn excluded(&self, p: &Path) -> bool {
+        for d in &self.exclude_dirs {
+            if p.starts_with(d) {
+                return true;
+            }
+        }
+        if !self.exclude_components.is_empty() {
+            for comp in p.components() {
+                if let std::path::Component::Normal(os) = comp {
+                    if let Some(name) = os.to_str() {
+                        if self.exclude_components.iter().any(|c| c == name) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
 }
 
 fn md5sum(path: &Path) -> io::Result<Md5> {
@@ -268,8 +308,12 @@ fn md5sum(path: &Path) -> io::Result<Md5> {
     Ok(format!("{:x}", md5::compute(buf)))
 }
 
-fn scan(root: &Path, filter: &ScanFilter) -> Vec<DuplicateGroup> {
-    let mut by_hash: HashMap<Md5, Vec<FileInfo>> = HashMap::new();
+/// Scan `root`, hash files, and build a list of folders that contain duplicate
+/// files. A folder appears in the result only if at least one file in it has
+/// the same content (hash) as some file elsewhere.
+fn scan(root: &Path, filter: &ScanFilter) -> Vec<Folder> {
+    // hash -> list of (path, size)
+    let mut by_hash: HashMap<Md5, Vec<(PathBuf, u64)>> = HashMap::new();
     let mut scanned = 0usize;
 
     for entry in WalkDir::new(root).into_iter().filter_map(Result::ok) {
@@ -277,18 +321,9 @@ fn scan(root: &Path, filter: &ScanFilter) -> Vec<DuplicateGroup> {
             continue;
         }
         let p = entry.path();
-        // directory exclusion
-        let mut excluded = false;
-        for d in &filter.exclude_dirs {
-            if p.starts_with(d) {
-                excluded = true;
-                break;
-            }
-        }
-        if excluded {
+        if filter.excluded(p) {
             continue;
         }
-
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(_) => continue,
@@ -312,112 +347,42 @@ fn scan(root: &Path, filter: &ScanFilter) -> Vec<DuplicateGroup> {
         by_hash
             .entry(hash)
             .or_insert_with(Vec::new)
-            .push(FileInfo {
-                path: p.to_path_buf(),
-                size: meta.len(),
-                keep: false,
-            });
+            .push((p.to_path_buf(), meta.len()));
     }
 
     println!("scanned {} files.", scanned);
 
-    // Keep only groups with >1 file (duplicates).
-    let mut groups: Vec<DuplicateGroup> = by_hash
-        .into_iter()
-        .filter(|(_, v)| v.len() > 1)
-        .map(|(hash, mut files)| {
-            // Sort by path so the first occurrence (canonical) is at top; default keep=the first.
-            files.sort_by(|a, b| a.path.cmp(&b.path));
-            if !files.is_empty() {
-                files[0].keep = true; // default: keep one copy
-            }
-            DuplicateGroup { hash, files }
-        })
-        .collect();
-    groups.sort_by(|a, b| b.files[0].size.cmp(&a.files[0].size));
-    groups
-}
-
-/// ======================
-/// VIEW MODEL for the web UI
-/// ======================
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FolderView {
-    folder: String,
-    /// file paths (duplicate copies) that live in this folder, grouped by group hash
-    groups: Vec<FolderGroupEntry>,
-    /// true if every file in this folder (across its groups) is marked keep
-    all_kept: bool,
-    /// how many duplicate copies live in this folder
-    dup_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FolderGroupEntry {
-    group_hash: String,
-    path: String,
-    size: u64,
-    keep: bool,
-    original: String,
-}
-
-fn build_folder_views(groups: &[DuplicateGroup], root: &Path) -> Vec<FolderView> {
-    // For each duplicate copy, bucket by parent folder. A folder appears in the
-    // list if it contains at least one duplicate copy.
-    let mut by_folder: HashMap<PathBuf, Vec<(usize, usize)>> = HashMap::new(); // folder -> Vec<(group_idx, file_idx)>
-    for (gi, g) in groups.iter().enumerate() {
-        for (fi, f) in g.files.iter().enumerate() {
-            if let Some(parent) = f.path.parent() {
-                by_folder
-                    .entry(parent.to_path_buf())
-                    .or_default()
-                    .push((gi, fi));
-            }
+    // Keep only hashes with >1 file (duplicates), then bucket every duplicate
+    // copy by its parent folder.
+    let mut by_folder: HashMap<PathBuf, Vec<FileEntry>> = HashMap::new();
+    for files in by_hash.into_values().filter(|v| v.len() > 1) {
+        for (path, size) in files {
+            let parent = path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+            by_folder
+                .entry(parent)
+                .or_insert_with(Vec::new)
+                .push(FileEntry {
+                    path: path.to_string_lossy().to_string(),
+                    size,
+                });
         }
     }
 
-    let mut views: Vec<FolderView> = by_folder
+    let mut folders: Vec<Folder> = by_folder
         .into_iter()
-        .map(|(folder, idxs)| {
-            let mut entries = Vec::with_capacity(idxs.len());
-            let mut all_kept = true;
-            for (gi, fi) in &idxs {
-                let f = &groups[*gi].files[*fi];
-                if !f.keep {
-                    all_kept = false;
-                }
-                // original = first file of the group (lowest path)
-                let original = groups[*gi]
-                    .files
-                    .first()
-                    .map(|x| x.path.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                entries.push(FolderGroupEntry {
-                    group_hash: groups[*gi].hash.clone(),
-                    path: f.path.to_string_lossy().to_string(),
-                    size: f.size,
-                    keep: f.keep,
-                    original,
-                });
-            }
-            // sort entries by path for stable display
-            entries.sort_by(|a, b| a.path.cmp(&b.path));
-            let dup_count = entries.len();
-            FolderView {
+        .map(|(folder, mut files)| {
+            files.sort_by(|a, b| a.path.cmp(&b.path));
+            let total_size = files.iter().map(|f| f.size).sum();
+            Folder {
                 folder: folder.to_string_lossy().to_string(),
-                groups: entries,
-                all_kept,
-                dup_count,
+                keep: false,
+                files,
+                total_size,
             }
         })
         .collect();
-
-    views.sort_by(|a, b| a.folder.cmp(&b.folder));
-
-    // If root is given, also annotate nothing else - we keep folder path absolute.
-    let _ = root;
-    views
+    folders.sort_by(|a, b| a.folder.cmp(&b.folder));
+    folders
 }
 
 /// ======================
@@ -428,63 +393,71 @@ fn build_folder_views(groups: &[DuplicateGroup], root: &Path) -> Vec<FolderView>
 struct AppState {
     root: PathBuf,
     target: PathBuf,
-    groups: Vec<DuplicateGroup>,
-    folder_views: Vec<FolderView>,
+    folders: Vec<Folder>,
 }
 
 type SharedState = Arc<Mutex<AppState>>;
-
-fn rebuild_folder_views(st: &mut AppState) {
-    st.folder_views = build_folder_views(&st.groups, &st.root);
-}
 
 /// ======================
 /// MOVE
 /// ======================
 
-fn move_non_kept(groups: &mut Vec<DuplicateGroup>, root: &Path, target: &Path) -> io::Result<usize> {
+/// Move every file in every non-kept folder to target/<rel path from root>.
+/// Returns (moved, errors). Errors are per-file so one bad file doesn't abort
+/// the whole batch.
+fn move_non_kept(
+    folders: &mut Vec<Folder>,
+    root: &Path,
+    target: &Path,
+) -> (usize, Vec<String>) {
     let mut moved = 0;
-    for g in groups.iter_mut() {
-        // safety: each group must keep at least one file
-        if !g.files.iter().any(|f| f.keep) {
-            println!("group {} has no kept file; skipping move for this group", g.hash);
+    let mut errors: Vec<String> = Vec::new();
+
+    for fv in folders.iter_mut() {
+        if fv.keep {
             continue;
         }
-        for f in g.files.iter_mut().filter(|f| !f.keep) {
-            let rel = match f.path.strip_prefix(root) {
+        // Snapshot of paths we'll move (we mutate files below).
+        let to_move: Vec<(String, u64)> = fv.files.iter().map(|f| (f.path.clone(), f.size)).collect();
+        for (path_str, _size) in &to_move {
+            let p = Path::new(path_str);
+            let rel = match p.strip_prefix(root) {
                 Ok(r) => r,
                 Err(_) => {
-                    println!(
-                        "skip (not under root): {:?}",
-                        f.path
-                    );
+                    errors.push(format!("not under root: {}", path_str));
                     continue;
                 }
             };
             let dest = target.join(rel);
             if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            println!("moving ||{:?}||  -->  ||{:?}||", f.path, dest);
-            // Prefer rename; fall back to copy+delete across volumes.
-            if let Err(e) = fs::rename(&f.path, &dest) {
-                if e.raw_os_error() == Some(18) /* EXDEV */ || e.kind() == io::ErrorKind::CrossesDevices {
-                    fs::copy(&f.path, &dest)?;
-                    fs::remove_file(&f.path)?;
-                } else {
-                    return Err(e);
+                if let Err(e) = fs::create_dir_all(parent) {
+                    errors.push(format!("mkdir {} failed: {}", parent.display(), e));
+                    continue;
                 }
             }
-            f.keep = true; // it's gone now
+            println!("moving ||{}||  -->  ||{}||", p.display(), dest.display());
+            if let Err(e) = fs::rename(p, &dest) {
+                if e.raw_os_error() == Some(18) /* EXDEV */
+                    || e.kind() == io::ErrorKind::CrossesDevices
+                {
+                    if let Err(e2) = fs::copy(p, &dest).and_then(|_| fs::remove_file(p)) {
+                        errors.push(format!("copy {} failed: {}", path_str, e2));
+                        continue;
+                    }
+                } else {
+                    errors.push(format!("rename {} failed: {}", path_str, e));
+                    continue;
+                }
+            }
             moved += 1;
         }
+        // The folder's files have been moved; clear them so the UI updates.
+        fv.files.clear();
     }
-    // Prune moved files from groups so UI stays consistent.
-    for g in groups.iter_mut() {
-        g.files.retain(|f| Path::new(&f.path).exists());
-    }
-    groups.retain(|g| g.files.len() > 1);
-    Ok(moved)
+
+    // Drop folders that are now empty.
+    folders.retain(|f| !f.files.is_empty() || f.keep);
+    (moved, errors)
 }
 
 /// ======================
@@ -521,96 +494,31 @@ async fn index_handler() -> impl IntoResponse {
 struct StateResponse {
     root: String,
     target: String,
-    groups_count: usize,
-    total_dupes: usize,
-    folders: Vec<FolderView>,
-    groups: Vec<DuplicateGroup>,
-    /// how many groups currently have zero kept files (UI should block move)
-    ambiguous: usize,
+    folders: Vec<Folder>,
+    kept_folders: usize,
+    total_files: usize,
+    total_size: u64,
 }
 
 async fn get_state(State(st): State<SharedState>) -> Json<StateResponse> {
     let s = st.lock().unwrap();
-    let total_dupes: usize = s.groups.iter().map(|g| g.files.len()).sum();
-    let ambiguous = s
-        .groups
-        .iter()
-        .filter(|g| !g.files.iter().any(|f| f.keep))
-        .count();
+    let kept_folders = s.folders.iter().filter(|f| f.keep).count();
+    let total_files: usize = s.folders.iter().map(|f| f.files.len()).sum();
+    let total_size: u64 = s.folders.iter().map(|f| f.total_size).sum();
     Json(StateResponse {
         root: s.root.to_string_lossy().to_string(),
         target: s.target.to_string_lossy().to_string(),
-        groups_count: s.groups.len(),
-        total_dupes,
-        folders: s.folder_views.clone(),
-        groups: s.groups.clone(),
-        ambiguous,
+        folders: s.folders.clone(),
+        kept_folders,
+        total_files,
+        total_size,
     })
-}
-
-#[derive(Deserialize)]
-struct MarkFileBody {
-    path: String,
-    keep: bool,
-}
-
-async fn mark_file(
-    State(st): State<SharedState>,
-    Json(body): Json<MarkFileBody>,
-) -> Json<serde_json::Value> {
-    let mut s = st.lock().unwrap();
-    let target = fs::canonicalize(&body.path).unwrap_or_else(|_| PathBuf::from(&body.path));
-    let target_str = target.to_string_lossy().to_string();
-    let mut changed = false;
-    for g in s.groups.iter_mut() {
-        for f in g.files.iter_mut() {
-            let fp = fs::canonicalize(&f.path).unwrap_or_else(|_| f.path.clone());
-            if fp.to_string_lossy() == target_str {
-                f.keep = body.keep;
-                changed = true;
-            }
-        }
-    }
-    if changed {
-        rebuild_folder_views(&mut s);
-    }
-    Json(serde_json::json!({"ok": changed}))
-}
-
-#[derive(Deserialize)]
-struct MarkGroupBody {
-    group_hash: String,
-    keep_path: String,
-}
-
-/// Mark only the given path as keep in a group, un-keep all others in that group.
-async fn keep_only(
-    State(st): State<SharedState>,
-    Json(body): Json<MarkGroupBody>,
-) -> Json<serde_json::Value> {
-    let mut s = st.lock().unwrap();
-    let mut found = false;
-    for g in s.groups.iter_mut() {
-        if g.hash != body.group_hash {
-            continue;
-        }
-        found = true;
-        for f in g.files.iter_mut() {
-            f.keep = f.path.to_string_lossy() == body.keep_path;
-        }
-    }
-    if found {
-        rebuild_folder_views(&mut s);
-    }
-    Json(serde_json::json!({"ok": found}))
 }
 
 #[derive(Deserialize)]
 struct MarkFolderBody {
     folder: String,
     keep: bool,
-    /// if true, also mark all files in subfolders of `folder`
-    recursive: bool,
 }
 
 async fn mark_folder(
@@ -618,85 +526,66 @@ async fn mark_folder(
     Json(body): Json<MarkFolderBody>,
 ) -> Json<serde_json::Value> {
     let mut s = st.lock().unwrap();
-    let folder = fs::canonicalize(&body.folder).unwrap_or_else(|_| PathBuf::from(&body.folder));
-    let mut count = 0;
-    for g in s.groups.iter_mut() {
-        for f in g.files.iter_mut() {
-            let parent = f.path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-            let parent_canon = fs::canonicalize(&parent).unwrap_or(parent.clone());
-            let matches = if body.recursive {
-                parent_canon.starts_with(&folder)
-            } else {
-                parent_canon == folder
-            };
-            if matches {
-                f.keep = body.keep;
-                count += 1;
-            }
+    let target = fs::canonicalize(&body.folder).unwrap_or_else(|_| PathBuf::from(&body.folder));
+    let target_str = target.to_string_lossy().to_string();
+    let mut found = false;
+    for f in s.folders.iter_mut() {
+        let f_canon = fs::canonicalize(&f.folder).unwrap_or_else(|_| PathBuf::from(&f.folder));
+        if f_canon.to_string_lossy() == target_str {
+            f.keep = body.keep;
+            found = true;
         }
     }
-    if count > 0 {
-        rebuild_folder_views(&mut s);
+    Json(serde_json::json!({"ok": found}))
+}
+
+#[derive(Deserialize)]
+struct MarkAllBody {
+    keep: bool,
+}
+
+/// Mark every folder as keep (or un-keep every folder).
+async fn mark_all(
+    State(st): State<SharedState>,
+    Json(body): Json<MarkAllBody>,
+) -> Json<serde_json::Value> {
+    let mut s = st.lock().unwrap();
+    let n = s.folders.len();
+    for f in s.folders.iter_mut() {
+        f.keep = body.keep;
     }
-    Json(serde_json::json!({"ok": true, "marked": count}))
+    Json(serde_json::json!({"ok": true, "marked": n}))
 }
 
 #[derive(Serialize)]
 struct MoveResult {
     ok: bool,
     moved: usize,
-    ambiguous: usize,
+    kept_folders: usize,
+    errors: Vec<String>,
 }
 
 async fn move_marked(State(st): State<SharedState>) -> Json<MoveResult> {
     let mut s = st.lock().unwrap();
-    let ambiguous = s
-        .groups
-        .iter()
-        .filter(|g| !g.files.iter().any(|f| f.keep))
-        .count();
-    if ambiguous > 0 {
+    let kept = s.folders.iter().filter(|f| f.keep).count();
+    if kept == 0 && !s.folders.is_empty() {
         return Json(MoveResult {
             ok: false,
             moved: 0,
-            ambiguous,
+            kept_folders: 0,
+            errors: vec!["No folder is marked to keep — move blocked. Check at least one folder.".into()],
         });
     }
     let root = s.root.clone();
     let target = s.target.clone();
-    let res = move_non_kept(&mut s.groups, &root, &target);
-    match res {
-        Ok(n) => {
-            rebuild_folder_views(&mut s);
-            Json(MoveResult {
-                ok: true,
-                moved: n,
-                ambiguous: 0,
-            })
-        }
-        Err(e) => {
-            println!("move error: {:?}", e);
-            Json(MoveResult {
-                ok: false,
-                moved: 0,
-                ambiguous: 0,
-            })
-        }
-    }
-}
-
-async fn reset_keep(State(st): State<SharedState>) -> Json<serde_json::Value> {
-    let mut s = st.lock().unwrap();
-    for g in s.groups.iter_mut() {
-        for f in g.files.iter_mut() {
-            f.keep = false;
-        }
-        if let Some(first) = g.files.first_mut() {
-            first.keep = true;
-        }
-    }
-    rebuild_folder_views(&mut s);
-    Json(serde_json::json!({"ok": true}))
+    let (moved, errors) = move_non_kept(&mut s.folders, &root, &target);
+    let kept_folders = s.folders.iter().filter(|f| f.keep).count();
+    Json(MoveResult {
+        ok: errors.is_empty(),
+        moved,
+        kept_folders,
+        errors,
+    })
 }
 
 /// ======================
@@ -707,6 +596,57 @@ async fn reset_keep(State(st): State<SharedState>) -> Json<serde_json::Value> {
 async fn main() {
     let cli = Cli::parse();
 
+    // ---- preferences ----
+    let prefs = if cli.no_prefs {
+        Prefs::default_values()
+    } else {
+        Prefs::load()
+    };
+
+    // --save-prefs: persist the *effective* preferences (CLI merged onto loaded
+    // prefs as a union for lists; CLI wins for scalars) and exit.
+    // root/target are never stored.
+    if cli.save_prefs {
+        let mut to_save = prefs.clone();
+        fn union(a: &[String], b: &[String]) -> Vec<String> {
+            let mut out = a.to_vec();
+            for x in b {
+                if !out.contains(x) {
+                    out.push(x.clone());
+                }
+            }
+            out
+        }
+        if !cli.exclude_components.is_empty() {
+            to_save.exclude_components = union(&to_save.exclude_components, &cli.exclude_components);
+        }
+        if !cli.exclude_dirs.is_empty() {
+            to_save.exclude_dirs = union(&to_save.exclude_dirs, &cli.exclude_dirs);
+        }
+        if !cli.ignore_names.is_empty() {
+            to_save.ignore_names = union(&to_save.ignore_names, &cli.ignore_names);
+        }
+        if !cli.ignore_exts.is_empty() {
+            to_save.ignore_exts = union(&to_save.ignore_exts, &cli.ignore_exts);
+        }
+        if !cli.include.is_empty() {
+            to_save.include = union(&to_save.include, &cli.include);
+        }
+        if cli.min_size.is_some() {
+            to_save.min_size = cli.min_size.clone();
+        }
+        if let Some(b) = &cli.bind {
+            to_save.bind = b.clone();
+        }
+        to_save.open_browser = !cli.no_browser;
+        if let Err(e) = to_save.save() {
+            eprintln!("failed to save prefs: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // ---- root / target (job-specific, never from prefs) ----
     let root = fs::canonicalize(&cli.root).unwrap_or_else(|e| {
         eprintln!("invalid --root '{}': {}", cli.root, e);
         std::process::exit(1);
@@ -718,14 +658,21 @@ async fn main() {
     let target = PathBuf::from(&cli.target);
     fs::create_dir_all(&target).expect("could not create --target");
 
+    // ---- merge CLI flags with prefs (union for lists; CLI wins for scalars) ----
     let min_size = cli
         .min_size
         .as_deref()
+        .or(prefs.min_size.as_deref())
         .and_then(parse_bytes)
         .unwrap_or(0);
 
-    let include_globs = cli
+    let include_raw: Vec<String> = cli
         .include
+        .iter()
+        .chain(prefs.include.iter())
+        .cloned()
+        .collect();
+    let include_globs = include_raw
         .iter()
         .filter_map(|s| match Pattern::new(s) {
             Ok(p) => Some(p),
@@ -735,8 +682,14 @@ async fn main() {
             }
         })
         .collect::<Vec<_>>();
-    let ignore_name_globs = cli
+
+    let ignore_names_raw: Vec<String> = cli
         .ignore_names
+        .iter()
+        .chain(prefs.ignore_names.iter())
+        .cloned()
+        .collect();
+    let ignore_name_globs = ignore_names_raw
         .iter()
         .filter_map(|s| match Pattern::new(s) {
             Ok(p) => Some(p),
@@ -746,16 +699,27 @@ async fn main() {
             }
         })
         .collect::<Vec<_>>();
-    let ignore_exts = cli
+
+    let ignore_exts: Vec<String> = cli
         .ignore_exts
         .iter()
+        .chain(prefs.ignore_exts.iter())
         .map(|s| s.trim_start_matches('.').to_ascii_lowercase())
-        .collect::<Vec<_>>();
-    let exclude_dirs = cli
+        .collect();
+
+    let exclude_dirs: Vec<PathBuf> = cli
         .exclude_dirs
         .iter()
+        .chain(prefs.exclude_dirs.iter())
         .map(|s| fs::canonicalize(s).unwrap_or_else(|_| PathBuf::from(s)))
-        .collect::<Vec<_>>();
+        .collect();
+
+    let exclude_components: Vec<String> = cli
+        .exclude_components
+        .iter()
+        .chain(prefs.exclude_components.iter())
+        .cloned()
+        .collect();
 
     let filter = ScanFilter {
         min_size,
@@ -763,34 +727,37 @@ async fn main() {
         ignore_name_globs,
         ignore_exts,
         exclude_dirs,
+        exclude_components,
     };
 
-    println!("Scanning root : {}", root.display());
-    println!("Target folder : {}", target.display());
-    println!("Min size      : {} bytes", filter.min_size);
-    println!("Include globs : {:?}", cli.include);
-    println!("Ignore names  : {:?}", cli.ignore_names);
-    println!("Ignore exts   : {:?}", filter.ignore_exts);
-    println!("Exclude dirs  : {:?}", filter.exclude_dirs);
+    println!("Scanning root  : {}", root.display());
+    println!("Target folder  : {}", target.display());
+    println!("Min size       : {} bytes", filter.min_size);
+    println!("Include globs  : {}", include_raw.join(", "));
+    println!("Ignore names   : {}", ignore_names_raw.join(", "));
+    println!("Ignore exts    : {}", filter.ignore_exts.join(", "));
+    println!(
+        "Exclude dirs   : {}",
+        filter
+            .exclude_dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!("Exclude parts  : {}", filter.exclude_components.join(", "));
     println!("Scanning\u{2026}");
 
-    let groups = scan(&root, &filter);
+    let folders = scan(&root, &filter);
     println!(
-        "Found {} duplicate group(s).",
-        groups.len()
-    );
-
-    let folder_views = build_folder_views(&groups, &root);
-    println!(
-        "{} folder(s) contain duplicates.",
-        folder_views.len()
+        "Found {} folder(s) containing duplicates.",
+        folders.len()
     );
 
     let state = AppState {
         root,
         target,
-        groups,
-        folder_views,
+        folders,
     };
     let shared = Arc::new(Mutex::new(state));
 
@@ -811,23 +778,22 @@ async fn main() {
         .route("/", get(index_handler))
         .route("/index.html", get(index_handler))
         .route("/api/state", get(get_state))
-        .route("/api/mark_file", post(mark_file))
         .route("/api/mark_folder", post(mark_folder))
-        .route("/api/keep_only", post(keep_only))
+        .route("/api/mark_all", post(mark_all))
         .route("/api/move", post(move_marked))
-        .route("/api/reset_keep", post(reset_keep))
         .with_state(shared);
 
-    let bind: SocketAddr = cli
-        .bind
+    let bind_str = cli.bind.clone().unwrap_or_else(|| prefs.bind.clone());
+    let bind: SocketAddr = bind_str
         .parse()
         .unwrap_or_else(|e| {
-            eprintln!("invalid --bind '{}': {}", cli.bind, e);
+            eprintln!("invalid --bind '{}': {}", bind_str, e);
             std::process::exit(1);
         });
     println!("\nServing web UI on http://{}", bind);
 
-    if !cli.no_browser {
+    let open_browser = !cli.no_browser && prefs.open_browser;
+    if open_browser {
         let url = format!("http://{}", bind);
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(400));
@@ -870,132 +836,80 @@ mod gui {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.heading("Duplicate Finder");
                 ui.separator();
+                ui.label(format!("Root  : {}", s.root.display()));
+                ui.label(format!("Target: {}", s.target.display()));
 
-                ui.horizontal(|ui| {
-                    ui.label(format!("Root  : {}", s.root.display()));
-                });
-                ui.horizontal(|ui| {
-                    ui.label(format!("Target: {}", s.target.display()));
-                });
-
-                let total = s.groups.iter().map(|g| g.files.len()).sum::<usize>();
-                let ambiguous = s
-                    .groups
-                    .iter()
-                    .filter(|g| !g.files.iter().any(|f| f.keep))
-                    .count();
+                let kept = s.folders.iter().filter(|f| f.keep).count();
+                let total_files: usize = s.folders.iter().map(|f| f.files.len()).sum();
                 ui.add_space(4.0);
                 ui.label(format!(
-                    "{} duplicate group(s) \u{2022} {} duplicate files \u{2022} {} folder(s)",
-                    s.groups.len(),
-                    total,
-                    s.folder_views.len()
+                    "{} folder(s) with duplicates \u{2022} {} file(s) \u{2022} {} folder(s) kept",
+                    s.folders.len(),
+                    total_files,
+                    kept
                 ));
 
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Reset keep (one per group)").clicked() {
-                        for g in s.groups.iter_mut() {
-                            for f in g.files.iter_mut() {
-                                f.keep = false;
-                            }
-                            if let Some(first) = g.files.first_mut() {
-                                first.keep = true;
-                            }
+                    if ui.button("Keep all folders").clicked() {
+                        for f in s.folders.iter_mut() {
+                            f.keep = true;
                         }
-                        rebuild_folder_views(&mut s);
                     }
-                    let move_enabled = ambiguous == 0 && !s.groups.is_empty();
-                    let clicked = ui.add_enabled(move_enabled, egui::Button::new("Move non-kept")).clicked();
+                    if ui.button("Un-keep all folders").clicked() {
+                        for f in s.folders.iter_mut() {
+                            f.keep = false;
+                        }
+                    }
+                    let move_enabled = kept > 0 || s.folders.is_empty();
+                    let clicked = ui
+                        .add_enabled(move_enabled, egui::Button::new("Move non-kept"))
+                        .clicked();
                     if clicked {
                         let root = s.root.clone();
                         let target = s.target.clone();
-                        match move_non_kept(&mut s.groups, &root, &target) {
-                            Ok(n) => {
-                                println!("moved {} files", n);
-                                rebuild_folder_views(&mut s);
-                            }
-                            Err(e) => println!("move error: {:?}", e),
+                        let (moved, errors) = move_non_kept(&mut s.folders, &root, &target);
+                        println!("moved {} files, {} error(s)", moved, errors.len());
+                        for e in &errors {
+                            println!("  err: {}", e);
                         }
                     }
                 });
 
-                if ambiguous > 0 {
-                    ui.colored_label(egui::Color32::RED, format!(
-                        "{} group(s) have no kept file \u{2014} move blocked.",
-                        ambiguous
-                    ));
+                if kept == 0 && !s.folders.is_empty() {
+                    ui.colored_label(
+                        egui::Color32::RED,
+                        "No folder is marked to keep \u{2014} move blocked.",
+                    );
                 }
 
                 ui.separator();
                 ui.label("Folders containing duplicates (check to keep in place):");
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let mut actions: Vec<(PathBuf, bool, bool)> = Vec::new(); // (folder, keep, recursive)
-                    let mut file_actions: Vec<(String, bool)> = Vec::new(); // (path, keep)
-
-                    for fv in s.folder_views.iter().take(5_000) {
-                        let folder_pb = PathBuf::from(&fv.folder);
-                        let mut keep_all = fv.all_kept;
-                        ui.collapsing(format!("{}  [{} dups]", fv.folder, fv.dup_count), |ui| {
-                            if ui.checkbox(&mut keep_all, "Keep all in this folder (+ subfolders)").changed() {
-                                actions.push((folder_pb.clone(), keep_all, true));
+                    let mut toggles: Vec<(usize, bool)> = Vec::new();
+                    for (i, f) in s.folders.iter_mut().enumerate().take(5_000) {
+                        let mut keep = f.keep;
+                        let header = format!(
+                            "{}  [{} file(s), {} B]",
+                            f.folder,
+                            f.files.len(),
+                            f.total_size
+                        );
+                        ui.collapsing(header, |ui| {
+                            if ui.checkbox(&mut keep, "Keep this folder in place").changed() {
+                                toggles.push((i, keep));
                             }
                             ui.separator();
-                            // group entries by hash
-                            let mut last_hash: Option<String> = None;
-                            for e in &fv.groups {
-                                if last_hash.as_deref() != Some(&e.group_hash) {
-                                    last_hash = Some(e.group_hash.clone());
-                                    ui.add_space(2.0);
-                                    ui.label(format!("group {} ({} copies in folder)", &e.group_hash[..12], 0));
-                                }
-                                let mut keep = e.keep;
-                                let label = format!("{}  [{} B]", e.path, e.size);
-                                if ui.checkbox(&mut keep, label).changed() {
-                                    file_actions.push((e.path.clone(), keep));
-                                }
+                            for fe in &f.files {
+                                ui.label(format!("{}  [{} B]", fe.path, fe.size));
                             }
                         });
                     }
-
-                    drop(s);
-
-                    // apply file actions
-                    for (path, keep) in &file_actions {
-                        let target = fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
-                        let target_str = target.to_string_lossy().to_string();
-                        let mut st = self.shared.lock().unwrap();
-                        for g in st.groups.iter_mut() {
-                            for f in g.files.iter_mut() {
-                                let fp = fs::canonicalize(&f.path).unwrap_or_else(|_| f.path.clone());
-                                if fp.to_string_lossy() == target_str {
-                                    f.keep = *keep;
-                                }
-                            }
+                    for (i, keep) in toggles {
+                        if let Some(f) = s.folders.get_mut(i) {
+                            f.keep = keep;
                         }
-                        rebuild_folder_views(&mut st);
-                    }
-
-                    // apply folder actions
-                    for (folder, keep, recursive) in &actions {
-                        let folder_canon = fs::canonicalize(folder).unwrap_or_else(|_| folder.clone());
-                        let mut st = self.shared.lock().unwrap();
-                        for g in st.groups.iter_mut() {
-                            for f in g.files.iter_mut() {
-                                let parent = f.path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-                                let parent_canon = fs::canonicalize(&parent).unwrap_or(parent.clone());
-                                let matches = if *recursive {
-                                    parent_canon.starts_with(&folder_canon)
-                                } else {
-                                    parent_canon == folder_canon
-                                };
-                                if matches {
-                                    f.keep = *keep;
-                                }
-                            }
-                        }
-                        rebuild_folder_views(&mut st);
                     }
                 });
             });
