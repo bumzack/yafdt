@@ -9,5 +9,7 @@
   "prioritize_folders": [
     "/Users/bumzack/stoff/coding/rust/yafdt/test_data/prio"
   ],
-  "unprioritize_folders": []
+  "unprioritize_folders": [],
+  "bind": "127.0.0.1:8787",
+  "open_browser": true
 }

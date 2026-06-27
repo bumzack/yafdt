@@ -4,11 +4,14 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eframe = "0.33"
-egui = "0.33"
 walkdir = "2"
 md5 = "0.7"
-crossbeam-channel = "0.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149" }
-
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+webbrowser = "1"
+rust-embed = "8"
+mime_guess = "2"
+clap = { version = "4", features = ["derive"] }
+glob = "0.3"

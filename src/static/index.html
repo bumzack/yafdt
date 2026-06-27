@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Duplicate Finder</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+<style>
+  body { padding: 1rem; max-width: 1200px; margin: 0 auto; }
+  .topbar { position: sticky; top: 0; background: #fff; z-index: 20; padding: .5rem 0; border-bottom: 1px solid #eee; margin-bottom: .5rem; }
+  .group-card { margin-bottom: .6rem; }
+  .folder-card { margin-bottom: .9rem; }
+  .file-row { display:flex; align-items:center; gap:.5rem; padding:.2rem .3rem; border-radius:.25rem; }
+  .file-row:hover { background:#f8f9fa; }
+  .file-path { font-size:.85rem; color:#495057; word-break: break-all; }
+  .file-size { font-size:.75rem; color:#888; }
+  .group-hash { font-size:.7rem; color:#999; font-family:monospace; }
+  .keep-cb { margin: 0; }
+  .warn { color:#8a6d3b; }
+  .badge-keep { background:#198754; }
+  .badge-move { background:#dc3545; }
+  .badge-amb { background:#6c757d; }
+  .folder-header { cursor: pointer; }
+  details summary { cursor: pointer; list-style: none; }
+  details summary::-webkit-details-marker { display: none; }
+  .chev { transition: transform .15s; display:inline-block; }
+  details[open] .chev { transform: rotate(90deg); }
+  .group-block { border-left: 3px solid #dee2e6; padding-left:.5rem; margin-bottom:.4rem; }
+  .group-block.kept { border-left-color:#198754; }
+  .group-block.ambiguous { border-left-color:#dc3545; }
+  .mb-0-last { margin-bottom: 0; }
+</style>
+</head>
+<body>
+
+<div class="topbar d-flex flex-wrap align-items-center gap-2">
+  <span class="fw-bold">Duplicate Finder</span>
+  <span id="summary" class="text-muted small"></span>
+  <div class="ms-auto d-flex gap-2">
+    <button id="resetBtn" class="btn btn-outline-secondary btn-sm">Reset keep (auto)</button>
+    <button id="moveBtn" class="btn btn-warning btn-sm">Move non-kept</button>
+  </div>
+</div>
+
+<div id="ambiguousWarning" class="alert alert-danger py-2 d-none">
+  Some duplicate groups have <b>no file marked to keep</b>. Move is blocked until
+  every group has at least one kept file.
+</div>
+
+<div id="folders"></div>
+
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+const API = "";
+function esc(s){ return $('<div>').text(s).html(); }
+function human(b){ if(b>=1024*1024*1024) return (b/1024/1024/1024).toFixed(2)+" GB";
+  if(b>=1024*1024) return (b/1024/1024).toFixed(2)+" MB";
+  if(b>=1024) return (b/1024).toFixed(1)+" KB"; return b+" B"; }
+function openKey(f){ return "open:"+f; }
+function rememberOpen(f, val){ val ? localStorage.setItem(openKey(f),"1") : localStorage.removeItem(openKey(f)); }
+function isOpen(f){ return localStorage.getItem(openKey(f))==="1"; }
+
+let LATEST = null;
+
+function refresh(){
+  $.getJSON(API+"/api/state").done(function(s){
+    LATEST = s;
+    const dupes = s.total_dupes;
+    $("#summary").html(
+      `root: <code>${esc(s.root)}</code> &middot; ` +
+      `target: <code>${esc(s.target)}</code> &middot; ` +
+      `${s.groups_count} group(s) &middot; ${dupes} duplicate files &middot; ` +
+      `${s.folders.length} folder(s) with duplicates`
+    );
+    const amb = s.ambiguous;
+    $("#ambiguousWarning").toggleClass("d-none", amb === 0)
+      .find("b").text(amb);
+    $("#moveBtn").prop("disabled", amb > 0 || s.groups_count === 0);
+    renderFolders(s.folders, s.groups);
+  }).fail(function(){
+    $("#folders").html('<div class="text-danger">Failed to load state.</div>');
+  });
+}
+
+function groupStatus(g){
+  // returns {kept:N, move:N, ambiguous:bool}
+  let kept=0, move=0;
+  g.files.forEach(f=> f.keep ? kept++ : move++);
+  return {kept, move, ambiguous: kept===0};
+}
+
+function renderFolders(folders, groups){
+  const $box = $("#folders").empty();
+  if (!folders.length){
+    $box.html('<div class="text-muted">No duplicates found.</div>');
+    return;
+  }
+  // index groups by hash for quick status
+  const groupByHash = {};
+  groups.forEach(g=> groupByHash[g.hash]=g);
+
+  folders.forEach((f, fi) => {
+    const cardId = `folder-${fi}`;
+    const open = isOpen(f.folder);
+    const card = $(`
+      <div class="card folder-card">
+        <div class="card-header py-2 d-flex align-items-center">
+          <details ${open?"open":""} class="w-100">
+            <summary class="folder-header d-flex align-items-center flex-wrap gap-2">
+              <span class="chev">\u25B6</span>
+              <div class="form-check keep-all-wrap">
+                <input class="form-check-input keep-folder-cb" type="checkbox" ${f.all_kept?"checked":""}>
+              </div>
+              <span class="fw-semibold">${esc(f.folder)}</span>
+              <span class="badge bg-secondary">${f.dup_count} dup file${f.dup_count===1?"":"s"}</span>
+            </summary>
+          </details>
+        </div>
+        <div class="card-body p-2" id="${cardId}"></div>
+      </div>
+    `);
+    $box.append(card);
+
+    const $body = card.find("#"+cardId);
+
+    // group entries by group_hash for display
+    const byGroup = {};
+    f.groups.forEach(e => {
+      (byGroup[e.group_hash] = byGroup[e.group_hash] || []).push(e);
+    });
+
+    Object.keys(byGroup).forEach(hash => {
+      const entries = byGroup[hash];
+      const g = groupByHash[hash];
+      const st = groupStatus(g);
+      const cls = st.ambiguous ? "ambiguous" : (st.kept>0 ? "kept" : "");
+      const $gb = $(`<div class="group-block ${cls}"></div>`);
+      $gb.append(`<div class="d-flex justify-content-between align-items-center">
+        <span class="group-hash">${esc(hash.substring(0,12))} \u2022 ${entries.length} copies in this folder</span>
+        <span class="small">
+          <span class="badge badge-keep">${st.kept} keep</span>
+          <span class="badge badge-move ms-1">${st.move} move</span>
+        </span>
+      </div>`);
+      entries.forEach(e => {
+        const row = $(`
+          <div class="file-row">
+            <input class="form-check-input keep-cb" type="checkbox" ${e.keep?"checked":""}>
+            <span class="file-path flex-grow-1">${esc(e.path)}</span>
+            <span class="file-size">${human(e.size)}</span>
+          </div>
+        `);
+        $gb.append(row);
+      });
+      $body.append($gb);
+    });
+
+    // events
+    card.find("details").on("toggle", function(){
+      rememberOpen(f.folder, this.open);
+    });
+    card.find(".keep-folder-cb").on("click", function(e){
+      e.stopPropagation();
+      const keep = this.checked;
+      const payload = { folder: f.folder, keep: keep, recursive: true };
+      $.ajax({url:API+"/api/mark_folder", method:"POST",
+        contentType:"application/json", data: JSON.stringify(payload)})
+       .done(refresh);
+    });
+    // per-file keep checkbox
+    $body.find(".keep-cb").on("click", function(){
+      const path = $(this).siblings(".file-path").text();
+      const keep = this.checked;
+      $.ajax({url:API+"/api/mark_file", method:"POST",
+        contentType:"application/json", data: JSON.stringify({path, keep})})
+       .done(refresh);
+    });
+  });
+}
+
+$("#moveBtn").on("click", function(){
+  if (!confirm("Move every duplicate file NOT marked \u201ckeep\u201d to the target folder?\n"
+             + "Each file keeps its relative path under the root. This cannot be undone.")) return;
+  $.post(API+"/api/move").done(function(res){
+    if (res.ok){
+      alert("Moved "+res.moved+" file(s).");
+    } else if (res.ambiguous && res.ambiguous>0){
+      alert("Move blocked: "+res.ambiguous+" group(s) have no kept file.");
+    } else {
+      alert("Move failed; see terminal.");
+    }
+    refresh();
+  }).fail(function(){ alert("Move request failed."); refresh(); });
+});
+
+$("#resetBtn").on("click", function(){
+  if (!confirm("Reset keep flags to one-per-group (first path kept)?")) return;
+  $.post(API+"/api/reset_keep").done(refresh);
+});
+
+refresh();
+</script>
+</body>
+</html>
